@@ -42,6 +42,7 @@ SCREENSHOT_DIR = DATA_DIR / "screenshots"
 POLL_MIN = float(os.getenv("QUOTA_POLL_MINUTES_MIN", "20"))
 POLL_MAX = float(os.getenv("QUOTA_POLL_MINUTES_MAX", "30"))
 PAGE_SETTLE_SECONDS = float(os.getenv("QUOTA_PAGE_SETTLE_SECONDS", "5"))
+SCREENSHOT_TIMEOUT_MS = int(float(os.getenv("QUOTA_SCREENSHOT_TIMEOUT_SECONDS", "15")) * 1000)
 try:
     RETENTION_DAYS = max(1, int(os.getenv("QUOTA_RETENTION_DAYS", "7")))
 except ValueError:
@@ -342,6 +343,44 @@ async def _notify(event: str, title: str, *, summary: str = "", subtitle: str = 
         LOG.warning("notification failed event=%s reason=%s", event, type(exc).__name__)
 
 
+async def _force_repaint(page: Any) -> None:
+    """截图前强制页面产出一帧新画面。
+
+    ⚠️ Xvfb 下的 Chromium 对**完全静止**的页面会停止产帧，而 ``Page.captureScreenshot``
+    要等一帧新画面才返回——2026-09-08 生产实测：codex 分析页 ``document.getAnimations()``
+    为 0，空闲后第一次截图必然 30s 超时（连续 8 轮采集全挂）；claude 页有 5 个常驻动画一直
+    产帧，因此从没失败过。先做一次可见变化（切前台 + 指针移动 + 1px 滚动回滚），同一张图
+    随即 0.1s 返回。这不是重试能解决的问题，重试前必须先制造这一帧。
+    """
+    await page.bring_to_front()
+    await page.mouse.move(20, 20)
+    await page.evaluate("() => { window.scrollBy(0, 1); window.scrollBy(0, -1); }")
+    await page.wait_for_timeout(400)
+
+
+async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
+    """取证截图。失败时返回 ``(None, 错误)``，**不产出指向不存在文件的路径**。
+
+    ⚠️ 该写法自 2026-09-08 起改正：截图原本与读文字共用一个 ``try``，超时就把整条采集的
+    ``status`` 写成 ``network_error``。文字其实解析成功（confidence 1.0），后果有三层：
+    看板显示「网络错误」、日报常挂「采集异常」、而 ``weekly_reset_candidate`` 要求前后两次
+    都 healthy，于是 **codex 的周额度重置告警被静默停用**。截图缺一张只是证据少一张。
+    另外失败时旧代码仍把路径写进库，看板的 ``<img>`` 因此 404，页面上是一排碎图。
+    """
+    error = ""
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)  # 首轮采集时 _db() 还没建过目录
+    for attempt in range(2):
+        path = SCREENSHOT_DIR / f"{provider}-{int(time.time())}.png"
+        try:
+            await _force_repaint(page)
+            await page.screenshot(path=str(path), full_page=True, timeout=SCREENSHOT_TIMEOUT_MS)
+            return path, ""
+        except Exception as exc:  # noqa: BLE001 - 截图失败不影响本轮采集结果
+            error = f"screenshot: {type(exc).__name__}: {str(exc)[:200]}"
+            LOG.warning("screenshot failed provider=%s attempt=%d reason=%s", provider, attempt + 1, error)
+    return None, error
+
+
 async def _capture(page: Any, provider: str) -> dict[str, Any]:
     captured_at = _utc_now()
     error = ""
@@ -373,11 +412,12 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
                     fields["weekly_remaining"] = f"{100.0 - weekly_used:g}%"
                 confidence = max(confidence, 0.9)
                 status = "healthy"
-        screenshot_path = SCREENSHOT_DIR / f"{provider}-{int(time.time())}.png"
-        await page.screenshot(path=str(screenshot_path), full_page=True)
     except Exception as exc:  # 保留失败记录，不能静默丢失截图/错误
         error = type(exc).__name__ + ": " + str(exc)[:500]
         status = "network_error"
+    screenshot_path, screenshot_error = await _screenshot(page, provider)
+    if screenshot_error:
+        error = f"{error} | {screenshot_error}" if error else screenshot_error
     fields = _with_absolute_resets(fields)
     digest = ""
     if screenshot_path and screenshot_path.exists():
@@ -574,6 +614,19 @@ def _quota_public(fields: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _shot_url(row: Any) -> str | None:
+    """只有截图文件真的还在，才给看板 URL。
+
+    ⚠️ 采集失败或截图超时的记录以前照样带 ``screenshot_url``，看板的 ``<img>`` 拿到 404，
+    页面上就是一排碎图（2026-09-08 实测 codex 那一列）。过期清理也会删文件、留不住的
+    历史行同理，所以判据是**文件存在**，不是路径非空。
+    """
+    path = row["screenshot_path"]
+    if not path or not Path(path).is_file():
+        return None
+    return f"{PUBLIC_API_PREFIX}/captures/{row['id']}/screenshot"
+
+
 @app.get("/v1/quota/latest")
 def latest() -> dict[str, Any]:
     conn = _db()
@@ -587,7 +640,7 @@ def latest() -> dict[str, Any]:
             "id": row["id"], "status": row["status"], "used": fields.get("used"),
             "remaining": fields.get("remaining"), "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
             "window": fields.get("window", ""), "reset_at": fields.get("reset_at"),
-            "screenshot_url": f"{PUBLIC_API_PREFIX}/captures/{row['id']}/screenshot",
+            "screenshot_url": _shot_url(row),
             "screenshot_captured_at": row["captured_at"], "confidence": row["confidence"],
             "text": row["text"], "error": row["error"],
         }
@@ -610,7 +663,7 @@ def history(limit: int = 100) -> dict[str, Any]:
             "used": fields.get("used"), "remaining": fields.get("remaining"),
             "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
             "window": fields.get("window", ""), "reset_at": fields.get("reset_at"),
-            "screenshot_url": f"{PUBLIC_API_PREFIX}/captures/{row['id']}/screenshot",
+            "screenshot_url": _shot_url(row),
             "confidence": row["confidence"], "error": row["error"],
         })
         result[row["provider"]][-1].update(public)
