@@ -20,13 +20,16 @@ from fastapi.responses import FileResponse
 from patchright.async_api import async_playwright
 
 from .core import (
+    alertable_posts,
     claude_reset_sections,
     codex_reset_sections,
     event_key,
     countdown_label,
     get_meta,
     normalize_reset,
+    is_reset_post,
     percent,
+    post_id,
     pick_report_slot,
     record_event_once,
     set_meta,
@@ -58,6 +61,22 @@ PROVIDERS = {
     "codex": "https://chatgpt.com/codex/cloud/settings/usage",
     "claude": "https://claude.ai/settings/usage",
 }
+
+# 额度页之外的观察位：Codex 的重置常在这个账号先放出来，比额度页早。
+# 置空即关闭该采集。provider 名是 "x-<账号>"，与额度 provider 分开存、分开渲染。
+X_ACCOUNT = os.getenv("QUOTA_X_ACCOUNT", "thsottiaux").strip().lstrip("@")
+X_PROVIDER = f"x-{X_ACCOUNT}" if X_ACCOUNT else ""
+X_URL = f"https://x.com/{X_ACCOUNT}" if X_ACCOUNT else ""
+X_POST_LIMIT = 8
+# 只有命中关键词的新帖才推送；其余照样入库、在看板上看得到。该账号发帖很杂（玩梗贴占多数），
+# 全推等于把告警变成时间线。
+X_KEYWORDS = tuple(
+    word.strip().lower()
+    for word in os.getenv("QUOTA_X_KEYWORDS", "reset,limit,quota,credit").split(",")
+    if word.strip()
+)
+# ⚠️ 首次上线时时间线上全是旧帖，没有这道年龄闸门会一次性推出一串历史告警。
+X_MAX_AGE_HOURS = float(os.getenv("QUOTA_X_MAX_AGE_HOURS", "24"))
 
 app = FastAPI(title="quota-monitor", version="0.1.0")
 _task: asyncio.Task[None] | None = None
@@ -169,6 +188,56 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
     if provider == "codex" and "usage" in lowered and fields:
         confidence = min(1.0, confidence + 0.1)
     return fields, confidence, status
+
+
+# ⚠️ 帖子正文不能从 body 文本里切。时间线是虚拟列表，正文、转发说明、引用卡片和「显示更多」
+# 在纯文本里连成一片，切不出边界也拿不到永久链接；每条帖子的 article 节点才是稳定边界。
+POST_SELECTOR = "article[data-testid='tweet']"
+_POST_JS = """
+els => els.slice(0, LIMIT).map(el => {
+  const time = el.querySelector('time');
+  const anchor = time ? time.closest('a') : null;
+  const body = el.querySelector("[data-testid='tweetText']");
+  const name = el.querySelector("[data-testid='User-Name']");
+  const handle = name ? (name.innerText.match(/@[A-Za-z0-9_]+/) || [''])[0] : '';
+  return {
+    url: anchor ? anchor.getAttribute('href') : '',
+    posted_at: time ? time.getAttribute('datetime') : '',
+    author: handle,
+    text: body ? body.innerText.slice(0, 600) : '',
+  };
+})
+"""
+
+
+async def _read_posts(page: Any) -> list[dict[str, Any]]:
+    items = await page.locator(POST_SELECTOR).evaluate_all(_POST_JS.replace("LIMIT", str(X_POST_LIMIT)))
+    posts: list[dict[str, Any]] = []
+    for item in items:
+        href = str(item.get("url") or "")
+        if not post_id(href):
+            continue
+        posts.append({
+            "id": post_id(href),
+            "url": f"https://x.com{href}" if href.startswith("/") else href,
+            "posted_at": item.get("posted_at") or "",
+            "author": item.get("author") or "",
+            "text": (item.get("text") or "").strip(),
+        })
+    return posts
+
+
+async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str]:
+    """X 观察位的解析。拿不到帖子就是页面结构变了或登录态掉了，绝不当成「没有新消息」。"""
+    lowered = text.lower()
+    posts = await _read_posts(page)
+    if not posts:
+        if "sign in" in lowered or "log in" in lowered or "登录" in lowered:
+            return {}, 0.0, "auth_required"
+        return {}, 0.0, "schema_changed"
+    for item in posts:
+        item["is_reset"] = is_reset_post(item["text"], X_KEYWORDS)
+    return {"account": X_ACCOUNT, "posts": posts}, 0.9, "healthy"
 
 
 PROVIDER_LABELS = {
@@ -381,6 +450,35 @@ async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
     return None, error
 
 
+async def _notify_post(item: dict[str, Any], screenshot_path: Path | None) -> None:
+    """观察位的推送：一条帖子一张卡。
+
+    正文按 300 字截断——飞书卡片一格半屏宽，长推文会把卡片撑成一屏；要看全文点原帖。
+    """
+    stamp = ""
+    try:
+        stamp = f"{datetime.fromisoformat(str(item['posted_at']).replace('Z', '+00:00')).astimezone(_display_tz()):%m/%d %H:%M}"
+    except ValueError:
+        stamp = str(item.get("posted_at") or "")
+    body = item["text"].strip().replace("\n", " ")
+    if len(body) > 300:
+        body = body[:300] + "…"
+    await _notify(
+        "quota.x_post",
+        f"@{X_ACCOUNT} 发布重置相关动态",
+        subtitle=f"发布于 {stamp} · {TZ_LABEL}",
+        level="warn",
+        tags=[{"text": "重置预告", "color": "orange"}],
+        segments=[
+            {"kind": "text", "text": f"**📣 @{item.get('author') or X_ACCOUNT}**　<font color='grey'>{stamp}</font>"},
+            {"kind": "text", "text": body},
+            {"kind": "text", "text": f"<font color='grey'>{item['url']}</font>"},
+        ],
+        screenshot_paths=[screenshot_path] if screenshot_path else [],
+        dedup_key=f"quota:x_post:{X_ACCOUNT}:{item['id']}",
+    )
+
+
 async def _capture(page: Any, provider: str) -> dict[str, Any]:
     captured_at = _utc_now()
     error = ""
@@ -393,7 +491,10 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         await page.reload(wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(int(PAGE_SETTLE_SECONDS * 1000))
         text = await page.locator("body").inner_text(timeout=15_000)
-        fields, confidence, status = _parse(provider, text)
+        if provider == X_PROVIDER:
+            fields, confidence, status = await _parse_posts(page, text)
+        else:
+            fields, confidence, status = _parse(provider, text)
         if provider == "claude":
             meters = await page.locator("[role=meter][aria-valuenow][aria-valuemax='100']").evaluate_all(
                 "els => els.map(e => ({value:e.getAttribute('aria-valuenow'), text:e.getAttribute('aria-valuetext') || ''}))"
@@ -429,7 +530,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     reset_key = f"{provider}:{fields.get('reset_at','')}" if fields.get("reset_at") else None
     reset_detected = False
     old_fields: dict[str, Any] = {}
-    if previous and status == "healthy" and previous["status"] == "healthy":
+    if provider != X_PROVIDER and previous and status == "healthy" and previous["status"] == "healthy":
         try:
             old_fields = json.loads(previous["fields_json"] or "{}")
         except json.JSONDecodeError:
@@ -450,10 +551,20 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             conn, event_key(provider, {"weekly_reset_at": fields.get("weekly_reset_at"), "weekly_remaining": fields.get("weekly_remaining")}), provider, captured_at,
             {"provider": provider, "fields": fields, "screenshot_sha256": digest},
         )
+    # 观察位的告警按帖子去重：键用 status id，和额度那条重置事件走同一张表，
+    # 因此过了保留期被清掉采集明细也不会重复推送。
+    new_posts: list[dict[str, Any]] = []
+    if provider == X_PROVIDER and status == "healthy":
+        for item in alertable_posts(fields.get("posts", []), datetime.now(timezone.utc),
+                                    keywords=X_KEYWORDS, max_age_hours=X_MAX_AGE_HOURS):
+            if record_event_once(conn, f"x:{X_ACCOUNT}:{item['id']}", provider, captured_at, item):
+                new_posts.append(item)
     conn.close()
     LOG.info("capture provider=%s status=%s confidence=%.2f screenshot=%s pruned=%d", provider, status, confidence, bool(digest), pruned)
     result = {"provider": provider, "status": status, "fields": fields, "screenshot_path": screenshot_path,
-              "captured_at": captured_at, "reset_detected": reset_detected}
+              "captured_at": captured_at, "reset_detected": reset_detected, "new_posts": new_posts}
+    for item in new_posts:
+        await _notify_post(item, screenshot_path)
     if reset_detected:
         label = PROVIDER_LABELS.get(provider, {"name": provider, "icon": "•", "color": "grey"})
         # 与日报同样的理由：值会折行，不能用靠行数对齐的 section 三列。
@@ -483,6 +594,17 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     return result
 
 
+def _find_page(pages: list[Any], provider: str) -> Any | None:
+    """按 provider 找已经开着的标签页。
+
+    ⚠️ 不能沿用「provider 名出现在 URL 里」这条通用规则：观察位的 provider 是
+    ``x-<账号>``，而单字母 ``x`` 会命中任何含 x 的 URL。观察位按 ``x.com`` 域名匹配。
+    """
+    if provider == X_PROVIDER:
+        return next((p for p in pages if "x.com/" in p.url.lower()), None)
+    return next((p for p in pages if provider in p.url.lower()), None)
+
+
 async def _run() -> None:
     # 关键安全边界：在 ATTACH_ENABLED 出现前，浏览器存在但 Playwright/CDP 不接管。
     while not _stop.is_set():
@@ -497,8 +619,11 @@ async def _run() -> None:
                     raise RuntimeError("quota Chrome has no browser context")
                 pages = list(context.pages)
                 captured: list[dict[str, Any]] = []
-                for provider, url in PROVIDERS.items():
-                    page = next((p for p in pages if provider in p.url.lower()), None)
+                targets = dict(PROVIDERS)
+                if X_PROVIDER:
+                    targets[X_PROVIDER] = X_URL
+                for provider, url in targets.items():
+                    page = _find_page(pages, provider)
                     if page is None:
                         page = await context.new_page()
                         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
@@ -506,6 +631,8 @@ async def _run() -> None:
                     elif provider == "claude" and "#settings/usage" not in page.url:
                         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                     elif provider == "codex" and "/codex/cloud/settings/" not in page.url:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                    elif provider == X_PROVIDER and X_ACCOUNT.lower() not in page.url.lower():
                         await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                     captured.append(await _capture(page, provider))
                 await _maybe_daily_report(captured)
@@ -515,6 +642,24 @@ async def _run() -> None:
             LOG.warning("monitor cycle failed: %s: %s", type(exc).__name__, exc)
         delay = random.uniform(POLL_MIN, POLL_MAX) * 60
         await asyncio.sleep(delay)
+
+
+def _watch_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """日报里的观察位：只写最近一条命中关键词的帖子，没有就写一句「无」。
+
+    这一行的作用是让人知道**观察位还活着**——完全不渲染的话，采集挂了在日报上看不出来。
+    """
+    posts = (item.get("fields") or {}).get("posts") or []
+    hits = alertable_posts(posts, datetime.now(timezone.utc),
+                           keywords=X_KEYWORDS, max_age_hours=24.0)
+    head = f"**📣 @{X_ACCOUNT}**"
+    if not hits:
+        return [{"kind": "text", "text": f"{head}　<font color='grey'>24h 内无重置相关动态</font>"}]
+    latest = hits[-1]
+    body = latest["text"].replace("\n", " ")
+    if len(body) > 160:
+        body = body[:160] + "…"
+    return [{"kind": "text", "text": f"{head}　<font color='grey'>{body}</font>"}]
 
 
 REPORT_META_KEY = "last_daily_report"
@@ -539,9 +684,15 @@ async def _maybe_daily_report(captured: list[dict[str, Any]]) -> None:
         set_meta(conn, REPORT_META_KEY, key)
     finally:
         conn.close()
-    paths = [item["screenshot_path"] for item in captured if item.get("screenshot_path")]
+    # ⚠️ 观察位不能进 _provider_segments：那个函数按「5h + 周额度」两格排版，
+    # 传一条没有额度字段的记录进去会渲染出两格「暂无数据」。
+    quota_items = [item for item in captured if item["provider"] != X_PROVIDER]
+    watch_items = [item for item in captured if item["provider"] == X_PROVIDER]
+    paths = [item["screenshot_path"] for item in quota_items if item.get("screenshot_path")]
     stamp = now
-    segments = [seg for item in captured for seg in _provider_segments(item)]
+    segments = [seg for item in quota_items for seg in _provider_segments(item)]
+    for item in watch_items:
+        segments.extend(_watch_segments(item))
     unhealthy = [item["provider"] for item in captured if item.get("status") != "healthy"]
     if unhealthy:
         segments.append({
@@ -611,6 +762,9 @@ def _quota_public(fields: dict[str, Any]) -> dict[str, Any]:
         "reset_at_iso": fields.get("reset_at_iso"),
         "weekly_reset_at_iso": fields.get("weekly_reset_at_iso"),
         "session_state": fields.get("session_state"),
+        # 观察位的字段；额度 provider 这两项为 None，前端据此区分要渲染哪种卡片。
+        "account": fields.get("account"),
+        "posts": fields.get("posts"),
     }
 
 

@@ -11,6 +11,14 @@ send account actions, or use provider API tokens. Keep the browser profile,
 SQLite database, screenshots, logs, and notification tokens on the host; they
 are intentionally excluded from Git.
 
+## Watch position
+
+Besides the two quota pages the monitor can watch one public X timeline
+(`QUOTA_X_ACCOUNT`, empty disables it) where upcoming resets are announced early.
+Posts are stored with the same retention as captures; only posts that match
+`QUOTA_X_KEYWORDS` and are newer than `QUOTA_X_MAX_AGE_HOURS` raise a notification,
+deduplicated by post id so a restart never re-sends one.
+
 ## Retention
 
 `QUOTA_RETENTION_DAYS` defaults to 7. After each capture, expired capture rows

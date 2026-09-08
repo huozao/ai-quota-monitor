@@ -301,3 +301,59 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def screenshot_url(capture_id: int, *, prefix: str = "/v1/quota/captures") -> str:
     """Return a same-origin URL; callers should expose it behind Authelia."""
     return f"{prefix}/{int(capture_id)}/screenshot"
+
+
+# ---- X（推文）观察位 --------------------------------------------------------
+
+_STATUS_ID = re.compile(r"/status/(\d+)")
+
+
+def post_id(url: Any) -> str:
+    """从帖子永久链接里取出 status id。
+
+    取 id 而不是整条 URL 当去重键：同一条帖子的链接会带 ``/photo/1``、``/analytics``
+    等后缀，按整条 URL 去重会把同一条帖子重复推送。认不出来返回空串，调用方跳过——
+    宁可漏推一条，也不要用不稳定的键去重。
+    """
+    match = _STATUS_ID.search(str(url or ""))
+    return match.group(1) if match else ""
+
+
+def is_reset_post(text: Any, keywords: tuple[str, ...]) -> bool:
+    """帖子正文是否命中重置相关关键词（大小写不敏感）。"""
+    lowered = str(text or "").lower()
+    return any(word in lowered for word in keywords)
+
+
+def post_is_fresh(posted_at: Any, now: datetime, max_age_hours: float) -> bool:
+    """帖子是否落在告警窗口内。
+
+    ⚠️ 首次上线时时间线上全是旧帖，缺这道闸门会一次性推出一串历史告警。时间取
+    ``<time datetime>`` 的 ISO 值（X 给的是 UTC），认不出来当作**不新鲜**：宁可漏推。
+    """
+    raw = str(posted_at or "").strip()
+    if not raw:
+        return False
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=now.tzinfo)
+    age_hours = (now - moment).total_seconds() / 3600.0
+    return -1.0 <= age_hours <= max_age_hours
+
+
+def alertable_posts(posts: list[dict[str, Any]], now: datetime, *,
+                    keywords: tuple[str, ...], max_age_hours: float) -> list[dict[str, Any]]:
+    """挑出「新鲜 + 命中关键词 + 有稳定 id」的帖子，按时间从旧到新。
+
+    顺序是从旧到新，多条一起出现时通知的先后跟发帖顺序一致。
+    """
+    picked = [
+        post for post in posts
+        if post_id(post.get("url"))
+        and is_reset_post(post.get("text"), keywords)
+        and post_is_fresh(post.get("posted_at"), now, max_age_hours)
+    ]
+    return sorted(picked, key=lambda item: str(item.get("posted_at") or ""))
