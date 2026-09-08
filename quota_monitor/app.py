@@ -77,6 +77,8 @@ X_KEYWORDS = tuple(
 )
 # ⚠️ 首次上线时时间线上全是旧帖，没有这道年龄闸门会一次性推出一串历史告警。
 X_MAX_AGE_HOURS = float(os.getenv("QUOTA_X_MAX_AGE_HOURS", "24"))
+# 时间线是虚拟列表，reload 之后要等它自己渲染出来；页面框架先到、帖子后到。
+X_POST_WAIT_MS = int(float(os.getenv("QUOTA_X_POST_WAIT_SECONDS", "15")) * 1000)
 
 app = FastAPI(title="quota-monitor", version="0.1.0")
 _task: asyncio.Task[None] | None = None
@@ -230,6 +232,14 @@ async def _read_posts(page: Any) -> list[dict[str, Any]]:
 async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str]:
     """X 观察位的解析。拿不到帖子就是页面结构变了或登录态掉了，绝不当成「没有新消息」。"""
     lowered = text.lower()
+    # ⚠️ 不能只靠 QUOTA_PAGE_SETTLE_SECONDS（默认 5 秒）就读。2026-09-08 生产实测 capture
+    # id=249：页面文字里资料头、关注数、Posts/Replies 标签都在（登录态正常），只是时间线
+    # 还没渲染，于是 0 条帖子被判成 schema_changed——看板显示「未读到帖子」、日报挂「采集
+    # 异常」，全是假警报。等第一条 article 出现再读，等不到才按空结果判。
+    try:
+        await page.locator(POST_SELECTOR).first.wait_for(timeout=X_POST_WAIT_MS)
+    except Exception:  # noqa: BLE001 - 等不到就走下面的空结果分支，由那里区分登录态与结构变化
+        LOG.warning("timeline did not render within %dms", X_POST_WAIT_MS)
     posts = await _read_posts(page)
     if not posts:
         if "sign in" in lowered or "log in" in lowered or "登录" in lowered:

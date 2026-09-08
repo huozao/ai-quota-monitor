@@ -55,9 +55,24 @@ def test_alertable_posts_filters_and_orders_oldest_first():
     assert [item["url"].rsplit("/", 1)[-1] for item in picked] == ["1", "3"]
 
 
+class _First:
+    """locator(...).first.wait_for()：没有帖子时模拟等待超时。"""
+
+    def __init__(self, items: list[dict[str, str]]) -> None:
+        self._items = items
+
+    async def wait_for(self, timeout: int = 0) -> None:
+        if not self._items:
+            raise TimeoutError("locator.wait_for: Timeout exceeded")
+
+
 class _PostLocator:
     def __init__(self, items: list[dict[str, str]]) -> None:
         self._items = items
+
+    @property
+    def first(self) -> _First:
+        return _First(self._items)
 
     async def evaluate_all(self, script: str) -> list[dict[str, str]]:
         return self._items
