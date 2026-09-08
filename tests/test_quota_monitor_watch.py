@@ -155,3 +155,28 @@ def test_capture_marks_schema_change_when_no_posts_found(data_dir, sent):
     assert result["status"] == "schema_changed"
     assert result["new_posts"] == []
     assert sent == []
+
+
+def _captured(posts: list[dict[str, str]]) -> dict[str, object]:
+    return {"provider": quota_app.X_PROVIDER, "status": "healthy", "fields": {"posts": posts}}
+
+
+def test_daily_report_line_shows_the_latest_hit():
+    segments = quota_app._watch_segments(_captured([
+        _fresh("All reset for everyone", "111"),
+        _fresh("we are so back", "222"),
+    ]))
+
+    assert len(segments) == 1
+    assert "All reset for everyone" in segments[0]["text"]
+
+
+def test_daily_report_line_survives_empty_and_missing_fields():
+    """⚠️ 这一行抛异常会让整档日报丢失：_maybe_daily_report 已经把 meta 落库，
+    异常被 _run 的 except 吞掉，那一档不会补发。"""
+    for item in ({"provider": quota_app.X_PROVIDER, "status": "healthy", "fields": {}},
+                 {"provider": quota_app.X_PROVIDER, "status": "schema_changed", "fields": None},
+                 _captured([_fresh("we are so back", "333")])):
+        segments = quota_app._watch_segments(item)
+        assert len(segments) == 1
+        assert "24h 内无重置相关动态" in segments[0]["text"]
