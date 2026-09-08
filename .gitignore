@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+quota_data/
+quota_browser_data/
+quota_logs/
+browser_data/
+logs/
+screenshots/
+*.sqlite3
