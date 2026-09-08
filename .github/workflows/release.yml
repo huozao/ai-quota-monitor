@@ -1,33 +1,80 @@
 name: release
 
+# 与 webdock 的 release 保持同一形状：先跑测试再出镜像，构建带 GHA layer cache。
+# ⚠️ 没有 cache 时每次都要重装 apt 包并重下 ~150MB 的 google-chrome-stable，
+# 2026-09-08 实测同一个 Dockerfile 的三次构建耗时 9 / 34 / 25 分钟，差异全在这几层。
 on:
   push:
     branches: [main]
+    tags: ["V*", "v*"]
 
-permissions:
-  contents: read
-  packages: write
+concurrency:
+  group: ai-quota-monitor-release
+  cancel-in-progress: false
 
 jobs:
-  build-push:
+  # ⚠️ 门禁不是摆设：直推 main 时 ci.yml 与本 workflow 并行跑，测试挂了照样会推出镜像，
+  # 而设备是按 sha 去 pin 的——坏提交会被 pin 成"正式版本"。构建必须等测试绿。
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q
+
+  build-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+
+      - name: Image metadata
         id: meta
+        uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # 不可变 pin = 完整 40 位 commit SHA（设备按它 pin）；latest 只跟 main。
           tags: |
-            type=raw,value=sha-${{ github.sha }}
-            type=raw,value=latest
-      - uses: docker/build-push-action@v6
+            type=sha,format=long
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          sbom: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ai-quota-monitor
+          cache-to: type=gha,mode=max,scope=ai-quota-monitor
+
+      - name: Export queryable SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          syft-version: v1.50.0
+          artifact-name: sbom-ai-quota-monitor-${{ github.sha }}.spdx.json
+          output-file: sbom-ai-quota-monitor.spdx.json
+          upload-artifact-retention: 30
+          upload-release-assets: false
