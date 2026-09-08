@@ -1,8 +1,11 @@
 name: release
 
 # 与 webdock 的 release 保持同一形状：先跑测试再出镜像，构建带 GHA layer cache。
-# ⚠️ 没有 cache 时每次都要重装 apt 包并重下 ~150MB 的 google-chrome-stable，
-# 2026-09-08 实测同一个 Dockerfile 的三次构建耗时 9 / 34 / 25 分钟，差异全在这几层。
+# ⚠️ 没有 cache 时每次都要重装 apt 包并重下 ~150MB 的 google-chrome-stable。
+# 2026-09-08 实测（同一份 Dockerfile，只改 Python 代码）：
+#   写死 aliyun apt 源 + 无缓存 …… 9 / 34 / 25 分钟（波动主要来自境外拉阿里云镜像站）
+#   官方 apt 源 + 冷缓存 ………… 7 分钟
+# 主因是 apt 源不是缓存——两者都改了，别只回滚一个就以为还快。
 on:
   push:
     branches: [main]
