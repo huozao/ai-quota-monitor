@@ -79,6 +79,8 @@ X_KEYWORDS = tuple(
 X_MAX_AGE_HOURS = float(os.getenv("QUOTA_X_MAX_AGE_HOURS", "24"))
 # 时间线是虚拟列表，reload 之后要等它自己渲染出来；页面框架先到、帖子后到。
 X_POST_WAIT_MS = int(float(os.getenv("QUOTA_X_POST_WAIT_SECONDS", "15")) * 1000)
+X_SCREENSHOT_PADDING_PX = 40
+X_SCREENSHOT_MAX_HEIGHT_PX = 3000
 
 app = FastAPI(title="quota-monitor", version="0.1.0")
 _task: asyncio.Task[None] | None = None
@@ -437,6 +439,47 @@ async def _force_repaint(page: Any) -> None:
     await page.wait_for_timeout(400)
 
 
+def _x_screenshot_height(viewport_height: float, article_bottom: float) -> int:
+    """Return a bounded document height ending shortly after the last loaded post."""
+    height = max(viewport_height, article_bottom + X_SCREENSHOT_PADDING_PX)
+    return min(int(height), X_SCREENSHOT_MAX_HEIGHT_PX)
+
+
+async def _x_screenshot_clip(page: Any) -> dict[str, int] | None:
+    """Build a compact clip from the X timeline's rendered article boundary."""
+    try:
+        metrics = await page.evaluate(
+            """() => {
+                const articles = Array.from(document.querySelectorAll("article[data-testid='tweet']"));
+                const bottoms = articles.map((article) => {
+                    const rect = article.getBoundingClientRect();
+                    return rect.bottom + window.scrollY;
+                }).filter(Number.isFinite);
+                return {
+                    viewport_width: window.innerWidth,
+                    viewport_height: window.innerHeight,
+                    article_bottom: bottoms.length ? Math.max(...bottoms) : 0,
+                };
+            }"""
+        )
+        if not isinstance(metrics, dict):
+            return None
+        width = float(metrics.get("viewport_width", 0))
+        viewport_height = float(metrics.get("viewport_height", 0))
+        article_bottom = float(metrics.get("article_bottom", 0))
+        if width <= 0 or viewport_height <= 0 or article_bottom <= 0:
+            return None
+        return {
+            "x": 0,
+            "y": 0,
+            "width": int(width),
+            "height": _x_screenshot_height(viewport_height, article_bottom),
+        }
+    except Exception as exc:  # noqa: BLE001 - screenshot can safely fall back to the viewport
+        LOG.warning("failed to calculate X screenshot clip: %s: %s", type(exc).__name__, exc)
+        return None
+
+
 async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
     """取证截图。失败时返回 ``(None, 错误)``，**不产出指向不存在文件的路径**。
 
@@ -452,7 +495,13 @@ async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
         path = SCREENSHOT_DIR / f"{provider}-{int(time.time())}.png"
         try:
             await _force_repaint(page)
-            await page.screenshot(path=str(path), full_page=True, timeout=SCREENSHOT_TIMEOUT_MS)
+            if provider == X_PROVIDER:
+                clip = await _x_screenshot_clip(page)
+                await page.screenshot(
+                    path=str(path), clip=clip, full_page=False, timeout=SCREENSHOT_TIMEOUT_MS
+                )
+            else:
+                await page.screenshot(path=str(path), full_page=True, timeout=SCREENSHOT_TIMEOUT_MS)
             return path, ""
         except Exception as exc:  # noqa: BLE001 - 截图失败不影响本轮采集结果
             error = f"screenshot: {type(exc).__name__}: {str(exc)[:200]}"

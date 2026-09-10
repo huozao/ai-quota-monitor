@@ -110,6 +110,63 @@ def test_screenshot_retry_succeeds_after_forced_repaint(data_dir):
     assert row["error"] == ""
 
 
+def test_x_screenshot_height_stops_after_last_rendered_post():
+    assert quota_app._x_screenshot_height(900, 2240) == 2280
+
+
+def test_x_screenshot_height_caps_pathological_document():
+    assert quota_app._x_screenshot_height(900, 7000) == quota_app.X_SCREENSHOT_MAX_HEIGHT_PX
+
+
+def test_x_screenshot_clip_uses_rendered_post_boundary(tmp_path, monkeypatch):
+    class FakeXPage:
+        async def evaluate(self, script: str):
+            return {"viewport_width": 1350, "viewport_height": 900, "article_bottom": 2240}
+
+    monkeypatch.setattr(quota_app, "SCREENSHOT_DIR", tmp_path)
+    clip = asyncio.run(quota_app._x_screenshot_clip(FakeXPage()))
+
+    assert clip == {"x": 0, "y": 0, "width": 1350, "height": 2280}
+
+
+def test_x_screenshot_passes_clip_instead_of_full_page(tmp_path, monkeypatch):
+    class _Mouse:
+        async def move(self, x: int, y: int) -> None:
+            return None
+
+    class FakeXPage:
+        mouse = _Mouse()
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def bring_to_front(self) -> None:
+            return None
+
+        async def evaluate(self, script: str):
+            if "querySelectorAll" in script:
+                return {"viewport_width": 1350, "viewport_height": 900, "article_bottom": 2240}
+            return None
+
+        async def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        async def screenshot(self, path: str, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            Path(path).write_bytes(b"png")
+
+    monkeypatch.setattr(quota_app, "SCREENSHOT_DIR", tmp_path)
+    page = FakeXPage()
+    result = asyncio.run(quota_app._screenshot(page, quota_app.X_PROVIDER))
+
+    assert result[0] is not None
+    assert page.kwargs == {
+        "clip": {"x": 0, "y": 0, "width": 1350, "height": 2280},
+        "full_page": False,
+        "timeout": quota_app.SCREENSHOT_TIMEOUT_MS,
+    }
+
+
 def test_page_failure_still_marks_network_error(data_dir):
     page = FakePage(CODEX_TEXT, screenshot_fails=0)
 
