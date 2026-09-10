@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 
@@ -129,16 +130,35 @@ def test_x_screenshot_clip_uses_rendered_post_boundary(tmp_path, monkeypatch):
     assert clip == {"x": 0, "y": 0, "width": 1350, "height": 2280}
 
 
-def test_x_screenshot_passes_clip_instead_of_full_page(tmp_path, monkeypatch):
+def test_x_screenshot_uses_cdp_beyond_viewport_and_writes_png(tmp_path, monkeypatch):
     class _Mouse:
         async def move(self, x: int, y: int) -> None:
             return None
 
+    class FakeCdpSession:
+        def __init__(self):
+            self.calls = []
+            self.detached = False
+
+        async def send(self, method: str, params: dict[str, object]):
+            self.calls.append((method, params))
+            return {"data": base64.b64encode(b"png-from-cdp").decode("ascii")}
+
+        async def detach(self):
+            self.detached = True
+
+    class FakeContext:
+        def __init__(self, session):
+            self.session = session
+
+        async def new_cdp_session(self, target):
+            return self.session
+
     class FakeXPage:
         mouse = _Mouse()
 
-        def __init__(self):
-            self.kwargs = None
+        def __init__(self, session):
+            self.context = FakeContext(session)
 
         async def bring_to_front(self) -> None:
             return None
@@ -151,20 +171,23 @@ def test_x_screenshot_passes_clip_instead_of_full_page(tmp_path, monkeypatch):
         async def wait_for_timeout(self, ms: int) -> None:
             return None
 
-        async def screenshot(self, path: str, **kwargs: object) -> None:
-            self.kwargs = kwargs
-            Path(path).write_bytes(b"png")
-
     monkeypatch.setattr(quota_app, "SCREENSHOT_DIR", tmp_path)
-    page = FakeXPage()
+    session = FakeCdpSession()
+    page = FakeXPage(session)
     result = asyncio.run(quota_app._screenshot(page, quota_app.X_PROVIDER))
 
     assert result[0] is not None
-    assert page.kwargs == {
-        "clip": {"x": 0, "y": 0, "width": 1350, "height": 2280},
-        "full_page": False,
-        "timeout": quota_app.SCREENSHOT_TIMEOUT_MS,
-    }
+    assert result[0].read_bytes() == b"png-from-cdp"
+    assert session.calls == [(
+        "Page.captureScreenshot",
+        {
+            "format": "png",
+            "fromSurface": True,
+            "captureBeyondViewport": True,
+            "clip": {"x": 0, "y": 0, "width": 1350, "height": 2280, "scale": 1},
+        },
+    )]
+    assert session.detached is True
 
 
 def test_page_failure_still_marks_network_error(data_dir):

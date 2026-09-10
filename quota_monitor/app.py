@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -480,6 +481,30 @@ async def _x_screenshot_clip(page: Any) -> dict[str, int] | None:
         return None
 
 
+async def _x_screenshot_via_cdp(page: Any, path: Path, clip: dict[str, int]) -> None:
+    """Capture a DOM-bounded X screenshot even when its height exceeds the viewport."""
+    session = await page.context.new_cdp_session(page)
+    try:
+        result = await asyncio.wait_for(
+            session.send(
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "fromSurface": True,
+                    "captureBeyondViewport": True,
+                    "clip": {**clip, "scale": 1},
+                },
+            ),
+            timeout=SCREENSHOT_TIMEOUT_MS / 1000,
+        )
+        encoded = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(encoded, str) or not encoded:
+            raise RuntimeError("Page.captureScreenshot returned no PNG data")
+        path.write_bytes(base64.b64decode(encoded, validate=True))
+    finally:
+        await session.detach()
+
+
 async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
     """取证截图。失败时返回 ``(None, 错误)``，**不产出指向不存在文件的路径**。
 
@@ -497,9 +522,9 @@ async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
             await _force_repaint(page)
             if provider == X_PROVIDER:
                 clip = await _x_screenshot_clip(page)
-                await page.screenshot(
-                    path=str(path), clip=clip, full_page=False, timeout=SCREENSHOT_TIMEOUT_MS
-                )
+                if clip is None:
+                    raise RuntimeError("X screenshot DOM boundary unavailable")
+                await _x_screenshot_via_cdp(page, path, clip)
             else:
                 await page.screenshot(path=str(path), full_page=True, timeout=SCREENSHOT_TIMEOUT_MS)
             return path, ""
