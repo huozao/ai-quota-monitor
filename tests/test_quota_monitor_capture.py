@@ -130,7 +130,7 @@ def test_x_screenshot_clip_uses_rendered_post_boundary(tmp_path, monkeypatch):
     assert clip == {"x": 0, "y": 0, "width": 1350, "height": 2280}
 
 
-def test_x_screenshot_uses_cdp_beyond_viewport_and_writes_png(tmp_path, monkeypatch):
+def test_x_screenshot_uses_emulated_viewport_and_writes_png(tmp_path, monkeypatch):
     class _Mouse:
         async def move(self, x: int, y: int) -> None:
             return None
@@ -142,7 +142,9 @@ def test_x_screenshot_uses_cdp_beyond_viewport_and_writes_png(tmp_path, monkeypa
 
         async def send(self, method: str, params: dict[str, object]):
             self.calls.append((method, params))
-            return {"data": base64.b64encode(b"png-from-cdp").decode("ascii")}
+            if method == "Page.captureScreenshot":
+                return {"data": base64.b64encode(b"png-from-cdp").decode("ascii")}
+            return {}
 
         async def detach(self):
             self.detached = True
@@ -178,15 +180,22 @@ def test_x_screenshot_uses_cdp_beyond_viewport_and_writes_png(tmp_path, monkeypa
 
     assert result[0] is not None
     assert result[0].read_bytes() == b"png-from-cdp"
-    assert session.calls == [(
-        "Page.captureScreenshot",
-        {
-            "format": "png",
-            "fromSurface": True,
-            "captureBeyondViewport": True,
-            "clip": {"x": 0, "y": 0, "width": 1350, "height": 2280, "scale": 1},
-        },
-    )]
+    assert session.calls == [
+        (
+            "Emulation.setDeviceMetricsOverride",
+            {"width": 1350, "height": 2280, "deviceScaleFactor": 1, "mobile": False},
+        ),
+        (
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": False,
+                "clip": {"x": 0, "y": 0, "width": 1350, "height": 2280, "scale": 1},
+            },
+        ),
+        ("Emulation.clearDeviceMetricsOverride", {}),
+    ]
     assert session.detached is True
 
 

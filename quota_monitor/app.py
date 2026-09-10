@@ -482,16 +482,23 @@ async def _x_screenshot_clip(page: Any) -> dict[str, int] | None:
 
 
 async def _x_screenshot_via_cdp(page: Any, path: Path, clip: dict[str, int]) -> None:
-    """Capture a DOM-bounded X screenshot even when its height exceeds the viewport."""
+    """Capture a DOM-bounded X screenshot with the virtual list inside the viewport."""
     session = await page.context.new_cdp_session(page)
+    emulation_set = False
     try:
+        await session.send(
+            "Emulation.setDeviceMetricsOverride",
+            {"width": clip["width"], "height": clip["height"], "deviceScaleFactor": 1, "mobile": False},
+        )
+        emulation_set = True
+        await _force_repaint(page)
         result = await asyncio.wait_for(
             session.send(
                 "Page.captureScreenshot",
                 {
                     "format": "png",
                     "fromSurface": True,
-                    "captureBeyondViewport": True,
+                    "captureBeyondViewport": False,
                     "clip": {**clip, "scale": 1},
                 },
             ),
@@ -502,7 +509,15 @@ async def _x_screenshot_via_cdp(page: Any, path: Path, clip: dict[str, int]) -> 
             raise RuntimeError("Page.captureScreenshot returned no PNG data")
         path.write_bytes(base64.b64decode(encoded, validate=True))
     finally:
-        await session.detach()
+        if emulation_set:
+            try:
+                await session.send("Emulation.clearDeviceMetricsOverride", {})
+            except Exception as exc:  # noqa: BLE001 - cleanup must not hide the capture error
+                LOG.warning("failed to clear X screenshot viewport override: %s: %s", type(exc).__name__, exc)
+        try:
+            await session.detach()
+        except Exception as exc:  # noqa: BLE001 - the CDP session is disposable
+            LOG.warning("failed to detach X screenshot CDP session: %s: %s", type(exc).__name__, exc)
 
 
 async def _screenshot(page: Any, provider: str) -> tuple[Path | None, str]:
