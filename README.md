@@ -4,6 +4,9 @@ Self-hosted Codex and Claude subscription-quota monitor. It reads the already
 authenticated browser pages through a local CDP connection, stores raw page
 text plus screenshots as evidence, and exposes a small FastAPI read API.
 
+For code entry points, local tests, and contribution boundaries, see
+[AGENTS.md](AGENTS.md). [CLAUDE.md](CLAUDE.md) is a compatibility entry to the same rules.
+
 ## Security boundary
 
 Login is manual through the local noVNC endpoint. The monitor does not log in,
@@ -24,6 +27,19 @@ deduplicated by post id so a restart never re-sends one.
 `QUOTA_RETENTION_DAYS` defaults to 7. After each capture, expired capture rows
 and their screenshots are removed. The retention setting limits history data;
 the browser profile is separate and is not pruned.
+
+## Runtime health and recovery
+
+The entrypoint removes stale Xvfb `:101` lock/socket files only when their
+recorded PID is absent or a zombie, then waits for the newly started Xvfb
+process and socket together. This protects the browser profile while allowing
+the container to recover after an unclean stop. `/healthz` also checks the
+dedicated Chrome CDP endpoint on `9224`; a dead browser returns HTTP `503`
+instead of reporting a false healthy container.
+
+The health check does not prove login, page parsing, notification delivery, or
+Feishu receipt. Verify those separately with the capture database and
+`notify_deliveries` in the private deployment runbook.
 
 ## Run locally
 

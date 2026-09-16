@@ -32,6 +32,6 @@ COPY docker/ docker/
 RUN mkdir -p /app/quota_browser_data /app/quota_data /app/quota_logs /app/.quota-vnc
 
 EXPOSE 8001 6082
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
   CMD curl -fsS http://localhost:8001/healthz || exit 1
 ENTRYPOINT ["/app/docker/quota-entrypoint.sh"]

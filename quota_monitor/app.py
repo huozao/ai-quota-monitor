@@ -92,6 +92,15 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _cdp_ready() -> bool:
+    """Return whether the dedicated Chrome CDP endpoint is accepting reads."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9224/json/version", timeout=1) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001 - health checks must fail closed
+        return False
+
+
 def _db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -830,7 +839,16 @@ async def shutdown() -> None:
 
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    return {"ok": True, "attach_enabled": ENABLE_FILE.exists(), "db": str(DB_PATH)}
+    cdp_ready = _cdp_ready()
+    result = {
+        "ok": cdp_ready,
+        "attach_enabled": ENABLE_FILE.exists(),
+        "browser_cdp": cdp_ready,
+        "db": str(DB_PATH),
+    }
+    if not cdp_ready:
+        raise HTTPException(status_code=503, detail=result)
+    return result
 
 
 @app.post("/v1/monitor/enable")
