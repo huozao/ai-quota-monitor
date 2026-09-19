@@ -41,6 +41,26 @@ The health check does not prove login, page parsing, notification delivery, or
 Feishu receipt. Verify those separately with the capture database and
 `notify_deliveries` in the private deployment runbook.
 
+### Browser tab invariant
+
+With the default configuration, the dedicated Chrome should have three page
+tabs: Codex, Claude, and the optional X watch page. The collector reuses the
+first page whose URL matches a provider and creates a page only when no match
+exists; it does not close additional matching pages. The entrypoint currently
+passes Codex and Claude URLs on every Chrome start, while the browser profile
+is persistent. After a browser/container restart, session restore plus those
+startup URLs can therefore leave a duplicate Codex tab. This was confirmed on
+webdock2 on 2026-09-19: CDP showed two identical Codex pages, while the
+capture database still had only one Codex capture per cycle. One duplicate was
+closed through the local CDP endpoint; no container restart or profile/data
+deletion was performed.
+
+Prevention is not yet deployed. A future change must choose one owner for
+startup page creation (entrypoint or collector), and add an explicit duplicate
+policy before changing the persistent profile. Until then, verify page count
+through CDP after a browser/container restart; do not delete the browser
+profile as a cleanup shortcut.
+
 ## Run locally
 
 ```bash
