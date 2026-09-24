@@ -62,7 +62,8 @@ accounts = resolve_accounts(
 instances = get_chrome_instances(accounts, os.getenv("QUOTA_PROFILE_DIR", "/app/quota_browser_data"))
 for inst in instances:
     urls_str = " ".join(inst["urls"])
-    print(f"{inst[\"port\"]}\t{inst[\"profile_dir\"]}\t{inst[\"pos\"]}\t{inst[\"size\"]}\t{urls_str}")
+    row = [str(inst["port"]), inst["profile_dir"], inst["pos"], inst["size"], urls_str]
+    print("\t".join(row))
 ' | while IFS=$'\t' read -r port profile_dir pos size urls; do
   mkdir -p "$profile_dir"
   rm -f "${profile_dir}/SingletonLock" "${profile_dir}/SingletonSocket" "${profile_dir}/SingletonCookie"
