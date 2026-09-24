@@ -309,3 +309,32 @@ def test_capture_multi_account_codex_sub(data_dir, monkeypatch):
     assert latest_data["providers"]["codex"]["label"] == "Codex (alice)"
     assert latest_data["providers"]["codex_sub"]["label"] == "Codex (bob)"
     assert latest_data["providers"]["codex_sub"]["resets_available"] == 1
+
+
+def test_page_matches_and_find_page():
+    class DummyPage:
+        def __init__(self, url):
+            self.url = url
+
+    p_chatgpt = DummyPage("https://chatgpt.com/")
+    p_codex = DummyPage("https://chatgpt.com/codex/cloud/settings/usage")
+    p_claude = DummyPage("https://claude.ai/settings/usage")
+    p_x = DummyPage("https://x.com/thsottiaux")
+
+    # Codex target matches both chatgpt.com and codex URL
+    assert quota_app._page_matches(p_chatgpt, {"id": "codex", "kind": "codex"}) is True
+    assert quota_app._page_matches(p_codex, {"id": "codex", "kind": "codex"}) is True
+    assert quota_app._page_matches(p_claude, {"id": "codex", "kind": "codex"}) is False
+
+    # Claude target
+    assert quota_app._page_matches(p_claude, {"id": "claude", "kind": "claude"}) is True
+    assert quota_app._page_matches(p_chatgpt, {"id": "claude", "kind": "claude"}) is False
+
+    # X target
+    assert quota_app._page_matches(p_x, {"id": "x-thsottiaux", "kind": "x"}) is True
+
+    # Find page
+    pages = [p_claude, p_chatgpt, p_x]
+    assert quota_app._find_page(pages, {"id": "codex", "kind": "codex"}) is p_chatgpt
+    assert quota_app._find_page(pages, {"id": "claude", "kind": "claude"}) is p_claude
+    assert quota_app._find_page(pages, {"id": "x-thsottiaux", "kind": "x"}) is p_x

@@ -841,12 +841,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     return result
 
 
-def _find_page(pages: list[Any], target: dict[str, Any] | str) -> Any | None:
-    """按 target 找已经开着的标签页。
-
-    ⚠️ 不能沿用「provider 名出现在 URL 里」这条通用规则：观察位的 provider 是
-    ``x-<账号>``，而单字母 ``x`` 会命中任何含 x 的 URL。观察位按 ``x.com`` 域名匹配。
-    """
+def _page_matches(p: Any, target: dict[str, Any] | str) -> bool:
     if isinstance(target, str):
         provider = target
         kind = provider_kind(provider)
@@ -854,9 +849,19 @@ def _find_page(pages: list[Any], target: dict[str, Any] | str) -> Any | None:
         provider = target["id"]
         kind = target.get("kind", provider_kind(provider))
 
+    url = str(getattr(p, "url", "")).lower()
     if kind == "x" or provider == X_PROVIDER:
-        return next((p for p in pages if "x.com/" in p.url.lower()), None)
-    return next((p for p in pages if kind in p.url.lower()), None)
+        return "x.com/" in url
+    if kind == "codex":
+        return "codex" in url or "chatgpt.com" in url
+    if kind == "claude":
+        return "claude.ai" in url
+    return kind in url
+
+
+def _find_page(pages: list[Any], target: dict[str, Any] | str) -> Any | None:
+    """按 target 找已经开着的标签页。"""
+    return next((p for p in pages if _page_matches(p, target)), None)
 
 
 async def _run() -> None:
@@ -885,12 +890,22 @@ async def _run() -> None:
                             provider = target["id"]
                             kind = target["kind"]
                             url = target["url"]
-                            page = _find_page(pages, target)
-                            if page is None:
+                            matching = [p for p in pages if _page_matches(p, target)]
+                            if not matching:
                                 page = await context.new_page()
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                                 pages.append(page)
-                            elif kind == "claude" and "#settings/usage" not in page.url:
+                            else:
+                                page = matching[0]
+                                # 保持浏览器单一标签页不变量：自动清理多余的同源重复页
+                                for dup in matching[1:]:
+                                    try:
+                                        await dup.close()
+                                        if dup in pages:
+                                            pages.remove(dup)
+                                    except Exception:
+                                        pass
+                            if kind == "claude" and "#settings/usage" not in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             elif kind == "codex" and "/codex/cloud/settings/" not in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
