@@ -79,23 +79,22 @@ Feishu receipt. Verify those separately with the capture database and
 
 ### Browser tab invariant
 
-With the default configuration, the dedicated Chrome should have three page
-tabs: Codex, Claude, and the optional X watch page. The collector reuses the
-first page whose URL matches a provider and creates a page only when no match
-exists; it does not close additional matching pages. The entrypoint currently
-passes Codex and Claude URLs on every Chrome start, while the browser profile
-is persistent. After a browser/container restart, session restore plus those
-startup URLs can therefore leave a duplicate Codex tab. This was confirmed on
-webdock2 on 2026-09-19: CDP showed two identical Codex pages, while the
-capture database still had only one Codex capture per cycle. One duplicate was
-closed through the local CDP endpoint; no container restart or profile/data
-deletion was performed.
+The collector enforces a strict single-tab invariant per target provider.
+`_page_matches` matches both platform domains and settings routes (e.g. `codex`
+and `chatgpt.com` for Codex; `claude.ai` for Claude; `x.com` for X).
 
-Prevention is not yet deployed. A future change must choose one owner for
-startup page creation (entrypoint or collector), and add an explicit duplicate
-policy before changing the persistent profile. Until then, verify page count
-through CDP after a browser/container restart; do not delete the browser
-profile as a cleanup shortcut.
+During each collection cycle, if session restore or startup arguments produce
+multiple matching tabs for a provider, the collector automatically reuses the
+first matching page and closes all redundant duplicates (`await dup.close()`).
+This was verified on webdock2 on 2026-09-24: multiple duplicate tabs on port 9225
+were automatically cleaned up to a single active page without disrupting the user session.
+
+### Notification constraints
+
+The internal notification service enforces a strict schema limit of at most 3
+items in `tags`. In multi-account setups, `quota_monitor/app.py` automatically
+caps `tags` to the first 3 items (`tags[:3]`) to ensure daily report delivery
+is never rejected with HTTP 422.
 
 ## Run locally
 
