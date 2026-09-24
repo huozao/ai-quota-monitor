@@ -27,6 +27,7 @@ from .core import (
     event_key,
     countdown_label,
     get_meta,
+    limit_reset_candidate,
     normalize_reset,
     is_reset_post,
     percent,
@@ -178,6 +179,28 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
             fields["reset_at"] = resets["five_hour_reset"]
         if resets["weekly_reset"]:
             fields["weekly_reset_at"] = resets["weekly_reset"]
+        resets_pos = text.lower().find("usage limit resets")
+        if resets_pos >= 0:
+            resets_section = text[resets_pos:]
+            avail_match = re.search(r"available\s*[:：]?\s*(\d+)|(\d+)\s+available", resets_section, flags=re.I)
+            if avail_match:
+                fields["resets_available"] = int(avail_match.group(1) or avail_match.group(2))
+            else:
+                fields["resets_available"] = 0
+            exp_match = re.search(
+                r"expires\s+(?:on\s+|at\s+)?([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?(?:,?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)",
+                resets_section,
+                flags=re.I,
+            )
+            if exp_match:
+                fields["resets_expires_at"] = exp_match.group(1).strip().rstrip(".")
+            else:
+                line_match = re.search(r"expires\s+(?:on\s+|at\s+)?([^\n]{1,80})", resets_section, flags=re.I)
+                if line_match:
+                    fields["resets_expires_at"] = line_match.group(1).strip().rstrip(".")
+            type_match = re.search(r"((?:full|weekly|5[\s-]*hour)\s*reset[^\n]*)", resets_section, flags=re.I)
+            if type_match:
+                fields["resets_type"] = type_match.group(1).strip()
         return fields, min(1.0, 0.6 + 0.1 * len(fields)) if fields else 0.0, "healthy" if fields else "schema_changed"
     fields: dict[str, Any] = {}
     patterns = {
@@ -263,8 +286,9 @@ async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str
 
 
 PROVIDER_LABELS = {
-    "codex": {"name": "Codex", "icon": "🤖", "color": "blue", "tag_color": "blue"},
-    "claude": {"name": "Claude", "icon": "🟣", "color": "violet", "tag_color": "violet"},
+    "codex": {"name": "Codex", "icon": "֎", "color": "blue", "tag_color": "blue"},
+    "claude": {"name": "Claude", "icon": "✴️", "color": "orange", "tag_color": "orange"},
+    "agy": {"name": "AGY", "icon": "∩", "color": "wathet", "tag_color": "wathet"},
 }
 STATUS_LABELS = {
     "healthy": "正常", "stale": "数据过期", "auth_required": "需重新登录",
@@ -280,9 +304,13 @@ def _display_tz() -> tzinfo:
 
 
 def _with_absolute_resets(fields: dict[str, Any]) -> dict[str, Any]:
-    """把两个重置文案换算成绝对时间存下来，下游不再各自猜时区。"""
+    """把重置与到期文案换算成绝对时间存下来，下游不再各自猜时区。"""
     now = datetime.now().astimezone()
-    for source, target in (("reset_at", "reset_at_iso"), ("weekly_reset_at", "weekly_reset_at_iso")):
+    for source, target in (
+        ("reset_at", "reset_at_iso"),
+        ("weekly_reset_at", "weekly_reset_at_iso"),
+        ("resets_expires_at", "resets_expires_at_iso"),
+    ):
         moment = normalize_reset(fields.get(source), now)
         if moment is not None:
             fields[target] = moment.isoformat()
@@ -364,16 +392,11 @@ def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         five_note = ""
 
-    meta = [f"{captured:%H:%M} 采集"]
-    if fields.get("credits_remaining") is not None:
-        meta.append(f"Credits {fields['credits_remaining']}")
-    if status != "healthy":
-        meta.append(STATUS_LABELS.get(status, status))
     weekly_reset = _reset_phrase(fields, "weekly_reset_at")
-    return [
+    segments: list[dict[str, Any]] = [
         {
             "kind": "text",
-            "text": f"**{label['icon']} {label['name']}**　<font color='grey'>{' · '.join(meta)}</font>",
+            "text": f"**{label['icon']} {label['name']}**",
         },
         {
             "kind": "fields",
@@ -388,6 +411,34 @@ def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
             ],
         },
     ]
+
+    extra_notes: list[str] = []
+    if status != "healthy":
+        extra_notes.append(f"<font color='red'>{STATUS_LABELS.get(status, status)}</font>")
+    resets_avail = fields.get("resets_available")
+    if resets_avail is not None and int(resets_avail or 0) > 0:
+        resets_num = int(resets_avail)
+        exp_phrase = _reset_phrase(fields, "resets_expires_at")
+        exp_suffix = f" ({exp_phrase.split(' · ')[0]} 到期)" if exp_phrase else ""
+        extra_notes.append(
+            f"<font color='grey'>💡 重置额度 </font><font color='green'>**{resets_num}**</font><font color='grey'> 次{exp_suffix}</font>"
+        )
+    if fields.get("credits_remaining") is not None:
+        extra_notes.append(f"<font color='grey'>Credits {fields['credits_remaining']}</font>")
+
+    if extra_notes:
+        segments.append({
+            "kind": "fields",
+            "fields": [
+                {
+                    "name": "",
+                    "value": "",
+                    "note": " <font color='grey'>·</font> ".join(extra_notes),
+                }
+            ],
+        })
+
+    return segments
 
 
 async def _notify(event: str, title: str, *, summary: str = "", subtitle: str = "",
@@ -411,7 +462,7 @@ async def _notify(event: str, title: str, *, summary: str = "", subtitle: str = 
                 continue
             ref = f"screen-{index}"
             caption = PROVIDER_LABELS.get(path.stem.split("-")[0], {}).get("name", path.stem)
-            images.append({"ref": ref, "caption": f"{caption} 页面截图", "png_base64": __import__("base64").b64encode(raw).decode()})
+            images.append({"ref": ref, "caption": f"{caption} 截图", "png_base64": __import__("base64").b64encode(raw).decode()})
             body_segments.append({"kind": "image", "image_ref": ref})
         except OSError:
             continue
@@ -637,6 +688,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     ).fetchone()
     reset_key = f"{provider}:{fields.get('reset_at','')}" if fields.get("reset_at") else None
     reset_detected = False
+    limit_reset_detected = False
     old_fields: dict[str, Any] = {}
     if provider != X_PROVIDER and previous and status == "healthy" and previous["status"] == "healthy":
         try:
@@ -644,6 +696,10 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             old_fields = {}
         reset_detected = weekly_reset_candidate(
+            {"status": status, "fields": fields},
+            {"status": previous["status"], "fields": old_fields},
+        )
+        limit_reset_detected = limit_reset_candidate(
             {"status": status, "fields": fields},
             {"status": previous["status"], "fields": old_fields},
         )
@@ -659,6 +715,11 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             conn, event_key(provider, {"weekly_reset_at": fields.get("weekly_reset_at"), "weekly_remaining": fields.get("weekly_remaining")}), provider, captured_at,
             {"provider": provider, "fields": fields, "screenshot_sha256": digest},
         )
+    if limit_reset_detected:
+        limit_reset_detected = record_event_once(
+            conn, f"limit_reset:{provider}:{fields.get('resets_available')}:{fields.get('resets_expires_at', '')}", provider, captured_at,
+            {"provider": provider, "fields": fields, "screenshot_sha256": digest},
+        )
     # 观察位的告警按帖子去重：键用 status id，和额度那条重置事件走同一张表，
     # 因此过了保留期被清掉采集明细也不会重复推送。
     new_posts: list[dict[str, Any]] = []
@@ -670,7 +731,8 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     conn.close()
     LOG.info("capture provider=%s status=%s confidence=%.2f screenshot=%s pruned=%d", provider, status, confidence, bool(digest), pruned)
     result = {"provider": provider, "status": status, "fields": fields, "screenshot_path": screenshot_path,
-              "captured_at": captured_at, "reset_detected": reset_detected, "new_posts": new_posts}
+              "captured_at": captured_at, "reset_detected": reset_detected,
+              "limit_reset_detected": limit_reset_detected, "new_posts": new_posts}
     for item in new_posts:
         await _notify_post(item, screenshot_path)
     if reset_detected:
@@ -698,6 +760,44 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             ],
             screenshot_paths=[screenshot_path] if screenshot_path else [],
             dedup_key=f"quota:weekly_reset:{provider}:{fields.get('weekly_reset_at','')}",
+        )
+    if limit_reset_detected:
+        label = PROVIDER_LABELS.get(provider, {"name": provider, "icon": "•", "color": "grey"})
+        resets_avail = fields.get("resets_available", 1)
+        cells = [{
+            "name": "可用次数",
+            "value": f"<font color='green'>**{resets_avail} 次**</font>",
+        }]
+        old_avail = old_fields.get("resets_available")
+        if old_avail is not None:
+            cells[0]["note"] = f"<font color='grey'>之前 {old_avail} 次</font>"
+        expires_phrase = _reset_phrase(fields, "resets_expires_at")
+        resets_type = fields.get("resets_type") or "可用于恢复 5 小时或周限额"
+        if expires_phrase:
+            cells.append({
+                "name": "到期时间",
+                "value": f"**{expires_phrase}**",
+                "note": f"<font color='grey'>{resets_type}</font>",
+            })
+        elif fields.get("resets_expires_at"):
+            cells.append({
+                "name": "到期时间",
+                "value": f"**{fields['resets_expires_at']}**",
+                "note": f"<font color='grey'>{resets_type}</font>",
+            })
+        moment = datetime.fromisoformat(captured_at).astimezone(_display_tz())
+        await _notify(
+            "quota.limit_reset",
+            f"{label['name']} 获得新重置额度",
+            subtitle=f"检测于 {moment:%Y/%m/%d %H:%M} · {TZ_LABEL}",
+            level="warn",
+            tags=[{"text": "重置额度", "color": "green"}],
+            segments=[
+                {"kind": "text", "text": f"**🎁 {label['name']} 重置额度已到账**"},
+                {"kind": "fields", "fields": cells},
+            ],
+            screenshot_paths=[screenshot_path] if screenshot_path else [],
+            dedup_key=f"quota:limit_reset:{provider}:{resets_avail}:{fields.get('resets_expires_at', '')}",
         )
     return result
 
@@ -871,6 +971,10 @@ def _quota_public(fields: dict[str, Any]) -> dict[str, Any]:
         "weekly_used": fields.get("weekly_used_percent"),
         "weekly_remaining": fields.get("weekly_remaining"),
         "credits_remaining": fields.get("credits_remaining"),
+        "resets_available": fields.get("resets_available"),
+        "resets_expires_at": fields.get("resets_expires_at"),
+        "resets_expires_at_iso": fields.get("resets_expires_at_iso"),
+        "resets_type": fields.get("resets_type"),
         "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
         "window": fields.get("window", ""),
         "reset_at": fields.get("reset_at"),

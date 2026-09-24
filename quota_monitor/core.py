@@ -65,6 +65,32 @@ def weekly_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | N
     return (reset_changed and delta > 0) or delta >= 20.0
 
 
+def limit_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | None) -> bool:
+    """Only detect when new manual resets are granted or increased.
+
+    判定是否获得了新的额度重置次数（Usage limit resets）。
+    触发条件：
+    1. 前后状态均为 healthy；
+    2. 当前可用重置次数 > 0；
+    3. 可用次数较上一轮增加（例如 0 -> 1，或 1 -> 2）；
+    4. 或可用次数未变（> 0）但到期时间更新（上一批已刷新/换成了新的一批）。
+    使用掉重置（次数减少）或次数与到期时间不变时绝不告警。
+    """
+    if not previous or current.get("status") != "healthy" or previous.get("status") != "healthy":
+        return False
+    now_fields = current.get("fields", {})
+    old_fields = previous.get("fields", {})
+    now_count = int(now_fields.get("resets_available") or 0)
+    old_count = int(old_fields.get("resets_available") or 0)
+    if now_count <= 0:
+        return False
+    if now_count > old_count:
+        return True
+    now_exp = now_fields.get("resets_expires_at")
+    old_exp = old_fields.get("resets_expires_at")
+    return bool(now_exp and old_exp and now_exp != old_exp)
+
+
 # 「Resets in 5 min」「Resets at 3:59 AM」「will reset after 2:24 AM.」三种前缀都出现过，
 # 引导词不属于时间本身，跟着进字段会让归一化认不出来。
 _RESET_LINE = re.compile(r"resets?\s+(?:in\s+|at\s+|after\s+)?([^\n]{1,80})", re.I)
@@ -141,7 +167,22 @@ _RELATIVE_UNITS = (
     (re.compile(r"(\d+)\s*m(?:in|ins|inute|inutes)?\b", re.I), "minutes"),
 )
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-_ABSOLUTE_FORMATS = ("%b %d, %Y %I:%M %p", "%b %d, %Y %H:%M", "%B %d, %Y %I:%M %p", "%b %d, %Y")
+_ABSOLUTE_FORMATS = (
+    "%b %d, %Y, %I:%M %p",
+    "%b %d, %Y %I:%M %p",
+    "%b %d, %Y %H:%M",
+    "%B %d, %Y, %I:%M %p",
+    "%B %d, %Y %I:%M %p",
+    "%b %d, %Y",
+)
+_ABSOLUTE_NO_YEAR_FORMATS = (
+    "%b %d, %I:%M %p",
+    "%b %d %I:%M %p",
+    "%B %d, %I:%M %p",
+    "%B %d %I:%M %p",
+    "%b %d, %H:%M",
+    "%b %d %H:%M",
+)
 
 
 def _parse_clock(value: str) -> tuple[int, int] | None:
@@ -192,6 +233,12 @@ def normalize_reset(raw: Any, now: datetime) -> datetime | None:
     for fmt in _ABSOLUTE_FORMATS:
         try:
             return datetime.strptime(cleaned, fmt).replace(tzinfo=now.tzinfo)
+        except ValueError:
+            continue
+    for fmt in _ABSOLUTE_NO_YEAR_FORMATS:
+        try:
+            parsed = datetime.strptime(f"{cleaned} {now.year}", f"{fmt} %Y").replace(tzinfo=now.tzinfo)
+            return parsed if parsed >= now else parsed.replace(year=now.year + 1)
         except ValueError:
             continue
     weekday_match = re.match(r"(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s+(.+)$", cleaned, flags=re.I)

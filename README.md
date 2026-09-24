@@ -22,6 +22,20 @@ Posts are stored with the same retention as captures; only posts that match
 `QUOTA_X_KEYWORDS` and are newer than `QUOTA_X_MAX_AGE_HOURS` raise a notification,
 deduplicated by post id so a restart never re-sends one.
 
+## Usage limit resets
+
+For Codex (ChatGPT), the collector parses the "Usage limit resets" section in
+addition to short-term (5h) and weekly usage limits. It captures:
+- `resets_available`: number of available manual resets (highlighted in Feishu notifications when > 0).
+- `resets_expires_at` / `resets_expires_at_iso`: expiration date and normalized UTC timestamp.
+- `resets_type`: reset policy string (e.g. `Full reset (Weekly + 5 hr)`).
+
+When new resets are granted or the expiration date changes, a `quota.limit_reset`
+event is triggered and deduplicated in SQLite (`quota:limit_reset:<provider>:<count>:<expires_at>`).
+In daily report cards, manual resets and credits are rendered as compact notation
+footnotes below the metrics grid, keeping provider title headers (`֎ Codex`, `✴️ Claude`, `∩ AGY`)
+clean, symmetrical, and uncluttered.
+
 ## Retention
 
 `QUOTA_RETENTION_DAYS` defaults to 7. After each capture, expired capture rows

@@ -10,6 +10,7 @@ from quota_monitor.core import (
     countdown_label,
     event_key,
     get_meta,
+    limit_reset_candidate,
     normalize_reset,
     pick_report_slot,
     record_event_once,
@@ -254,3 +255,45 @@ def test_daily_report_slot_survives_a_restart():
     assert get_meta(conn, "last_daily_report") == "2026-09-07:13:00"
     set_meta(conn, "last_daily_report", "2026-09-07:20:00")
     assert get_meta(conn, "last_daily_report") == "2026-09-07:20:00"
+
+
+def test_limit_reset_candidate_triggers_on_increase_or_new_expiry():
+    old = {"status": "healthy", "fields": {"resets_available": 0}}
+    new = {"status": "healthy", "fields": {"resets_available": 1, "resets_expires_at": "Oct 22, 6:31 PM"}}
+    assert limit_reset_candidate(new, old)
+
+    # 之前没有该字段（旧版本升级场景），只要新采集有可用次数即触发
+    old_untracked = {"status": "healthy", "fields": {}}
+    assert limit_reset_candidate(new, old_untracked)
+
+    # 次数进一步增加
+    newer = {"status": "healthy", "fields": {"resets_available": 2, "resets_expires_at": "Oct 22, 6:31 PM"}}
+    assert limit_reset_candidate(newer, new)
+
+    # 次数不变且到期时间不变不告警
+    assert not limit_reset_candidate(new, new)
+
+    # 使用掉重置（次数减少）不告警
+    consumed = {"status": "healthy", "fields": {"resets_available": 0}}
+    assert not limit_reset_candidate(consumed, new)
+
+    # 次数不变但到期时间更新（换了一批额度）告警
+    renewed = {"status": "healthy", "fields": {"resets_available": 1, "resets_expires_at": "Nov 22, 6:31 PM"}}
+    assert limit_reset_candidate(renewed, new)
+
+    # 非 healthy 状态不告警
+    assert not limit_reset_candidate({"status": "schema_changed", "fields": {"resets_available": 1}}, old)
+    assert not limit_reset_candidate(new, {"status": "network_error", "fields": {"resets_available": 0}})
+
+    # 没有 previous 不告警
+    assert not limit_reset_candidate(new, None)
+
+
+def test_normalize_reset_handles_month_day_and_time_without_year():
+    now = datetime(2026, 9, 24, 9, 2, tzinfo=timezone.utc)
+    parsed = normalize_reset("Oct 22, 6:31 PM", now)
+    assert parsed == datetime(2026, 10, 22, 18, 31, tzinfo=timezone.utc)
+
+    # 跨年情况（已过去的月份顺延至次年）
+    parsed_next_year = normalize_reset("Jan 5, 10:00 AM", now)
+    assert parsed_next_year == datetime(2027, 1, 5, 10, 0, tzinfo=timezone.utc)

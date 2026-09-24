@@ -217,3 +217,52 @@ def _row_error() -> str:
     row = _row(conn)
     conn.close()
     return row["error"]
+
+
+CODEX_WITH_LIMIT_RESETS = (
+    "5 hour usage limit\n\n100%\nremaining\n\n"
+    "Weekly usage limit\n\n0%\nremaining\nResets Sep 28, 2026 2:24 AM\n\n"
+    "Credits remaining\n\n441\n"
+    "Usage limit resets\n"
+    "Use a reset to restore your 5-hour limit, weekly limit, or both.\n"
+    "Available 1\nHistory\n"
+    "Full reset (Weekly + 5 hr)\n"
+    "Expires Oct 22, 6:31 PM\n"
+    "Use reset\n"
+)
+
+
+def test_codex_capture_parses_limit_resets_and_notifies(data_dir, monkeypatch):
+    notifications = []
+
+    async def fake_notify(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(quota_app, "_notify", fake_notify)
+
+    # 初始有一条无额度的前序记录
+    page_zero = FakePage(CODEX_TEXT, screenshot_fails=0)
+    res_zero = asyncio.run(quota_app._capture(page_zero, "codex"))
+    assert res_zero["status"] == "healthy"
+
+    # 新采集解析出 1 次重置及到期时间，并触发通知
+    page_reset = FakePage(CODEX_WITH_LIMIT_RESETS, screenshot_fails=0)
+    res_reset = asyncio.run(quota_app._capture(page_reset, "codex"))
+
+    assert res_reset["status"] == "healthy"
+    assert res_reset["limit_reset_detected"] is True
+    assert res_reset["fields"]["resets_available"] == 1
+    assert res_reset["fields"]["resets_expires_at"] == "Oct 22, 6:31 PM"
+    assert res_reset["fields"]["resets_expires_at_iso"] is not None
+    assert res_reset["fields"]["resets_type"] == "Full reset (Weekly + 5 hr)"
+
+    # 验证发出了一次 quota.limit_reset 通知
+    limit_notifs = [n for n in notifications if n[0][0] == "quota.limit_reset"]
+    assert len(limit_notifs) == 1
+    assert "重置额度已到账" in limit_notifs[0][1]["segments"][0]["text"]
+
+    # 再次采集相同内容（额度和到期时间不变），不再重复触发
+    notifications.clear()
+    res_again = asyncio.run(quota_app._capture(page_reset, "codex"))
+    assert res_again["limit_reset_detected"] is False
+    assert len(notifications) == 0
