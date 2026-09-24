@@ -983,7 +983,7 @@ async def _maybe_daily_report(captured: list[dict[str, Any]]) -> None:
         {"text": _provider_label(item["provider"]).get("name", item["provider"]),
          "color": _provider_label(item["provider"]).get("tag_color", "blue")}
         for item in captured
-    ][:4]
+    ][:3]
     await _notify(
         "quota.daily_report",
         "AI 额度日报",
