@@ -36,6 +36,28 @@ In daily report cards, manual resets and credits are rendered as compact notatio
 footnotes below the metrics grid, keeping provider title headers (`֎ Codex`, `✴️ Claude`, `∩ AGY`)
 clean, symmetrical, and uncluttered.
 
+## Multi-account support
+
+To monitor multiple Codex accounts within the same container, configure `QUOTA_CODEX_ACCOUNTS`
+in your `.env` (using usernames or email addresses):
+
+```bash
+QUOTA_CODEX_ACCOUNTS="codex:9224:alice,codex_2:9225:bob@example.com"
+```
+
+Labels in report cards and alerts will display the username or email prefix in brackets
+(e.g. `֎ Codex (alice)` and `֎ Codex (bob)`).
+
+- **Session Isolation**: Each account runs in a separate Chrome window with an isolated
+  profile directory (`/app/quota_browser_data` for port 9224, `/app/quota_browser_data/account_<port>`
+  for additional ports) and a distinct CDP remote debugging port.
+- **Manual Login**: In noVNC (`:6082`), windows are laid out side-by-side (`680x768`),
+  allowing straightforward manual authentication for each account without session crosstalk.
+- **Unified Reporting**: Captures are recorded under their respective provider keys, deduplicated
+  independently, and aggregated into a single consolidated daily report card with distinct labels.
+- **Health Verification**: `/healthz` monitors all configured CDP endpoints and reports individual
+  port health in `browser_cdp_ports`.
+
 ## Retention
 
 `QUOTA_RETENTION_DAYS` defaults to 7. After each capture, expired capture rows

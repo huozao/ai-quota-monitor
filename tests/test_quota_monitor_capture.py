@@ -266,3 +266,46 @@ def test_codex_capture_parses_limit_resets_and_notifies(data_dir, monkeypatch):
     res_again = asyncio.run(quota_app._capture(page_reset, "codex"))
     assert res_again["limit_reset_detected"] is False
     assert len(notifications) == 0
+
+
+def test_capture_multi_account_codex_sub(data_dir, monkeypatch):
+    monkeypatch.setenv("QUOTA_CODEX_ACCOUNTS", "codex:9224:alice,codex_sub:9225:bob@example.com")
+    notifications = []
+
+    async def fake_notify(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(quota_app, "_notify", fake_notify)
+
+    # 采集第一个账号 (alice)
+    page_main = FakePage(CODEX_TEXT, screenshot_fails=0)
+    res_main = asyncio.run(quota_app._capture(page_main, "codex"))
+    assert res_main["status"] == "healthy"
+    assert res_main["provider"] == "codex"
+
+    # 采集第二个账号 (bob@example.com -> bob)（初始前序记录）
+    page_sub_zero = FakePage(CODEX_TEXT, screenshot_fails=0)
+    res_sub_zero = asyncio.run(quota_app._capture(page_sub_zero, "codex_sub"))
+    assert res_sub_zero["status"] == "healthy"
+
+    # 账号 bob 获得新重置额度
+    page_sub = FakePage(CODEX_WITH_LIMIT_RESETS, screenshot_fails=0)
+    res_sub = asyncio.run(quota_app._capture(page_sub, "codex_sub"))
+    assert res_sub["status"] == "healthy"
+    assert res_sub["provider"] == "codex_sub"
+    assert res_sub["limit_reset_detected"] is True
+    assert res_sub["fields"]["resets_available"] == 1
+    assert res_sub["fields"]["resets_expires_at"] == "Oct 22, 6:31 PM"
+
+    # 验证通知标题带有其专属名称 Codex (bob)
+    limit_notifs = [n for n in notifications if n[0][0] == "quota.limit_reset"]
+    assert len(limit_notifs) == 1
+    assert "Codex (bob) 获得新重置额度" in limit_notifs[0][0][1]
+
+    # 验证 latest API 能同时返回两个独立账号且带用户名标签
+    latest_data = quota_app.latest()
+    assert "codex" in latest_data["providers"]
+    assert "codex_sub" in latest_data["providers"]
+    assert latest_data["providers"]["codex"]["label"] == "Codex (alice)"
+    assert latest_data["providers"]["codex_sub"]["label"] == "Codex (bob)"
+    assert latest_data["providers"]["codex_sub"]["resets_available"] == 1

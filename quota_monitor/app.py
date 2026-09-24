@@ -33,7 +33,9 @@ from .core import (
     percent,
     post_id,
     pick_report_slot,
+    provider_kind,
     record_event_once,
+    resolve_accounts,
     set_meta,
     weekly_reset_candidate,
 )
@@ -93,10 +95,10 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _cdp_ready() -> bool:
+def _cdp_ready(port: int = 9224) -> bool:
     """Return whether the dedicated Chrome CDP endpoint is accepting reads."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:9224/json/version", timeout=1) as response:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
             return response.status == 200
     except Exception:  # noqa: BLE001 - health checks must fail closed
         return False
@@ -148,7 +150,7 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
     lowered = text.lower()
     if any(x in lowered for x in ("log in", "sign in", "登录", "登录后")):
         return {}, 0.0, "auth_required"
-    if provider == "codex":
+    if provider_kind(provider) == "codex":
         fields: dict[str, Any] = {}
         five_hour = re.search(r"5\s*hour\s*usage\s*limit\s*([\d,.]+\s*%)\s*remaining", text, flags=re.I | re.S)
         weekly = re.search(r"weekly\s*usage\s*limit\s*([\d,.]+\s*%)\s*remaining", text, flags=re.I | re.S)
@@ -222,7 +224,7 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
         fields["session_state"] = "idle"
     confidence = min(1.0, 0.35 + 0.25 * len(fields))
     status = "healthy" if fields else "schema_changed"
-    if provider == "codex" and "usage" in lowered and fields:
+    if provider_kind(provider) == "codex" and "usage" in lowered and fields:
         confidence = min(1.0, confidence + 0.1)
     return fields, confidence, status
 
@@ -294,6 +296,43 @@ STATUS_LABELS = {
     "healthy": "正常", "stale": "数据过期", "auth_required": "需重新登录",
     "blocked": "访问受限", "schema_changed": "页面结构变化", "network_error": "网络错误",
 }
+
+
+def get_active_targets() -> list[dict[str, Any]]:
+    """获取当前所有活跃的采集目标列表。"""
+    return resolve_accounts(
+        raw_accounts=os.getenv("QUOTA_ACCOUNTS"),
+        raw_codex_accounts=os.getenv("QUOTA_CODEX_ACCOUNTS"),
+        x_account=X_ACCOUNT,
+    )
+
+
+def get_target_by_id(provider_id: str) -> dict[str, Any] | None:
+    for t in get_active_targets():
+        if t["id"] == provider_id:
+            return t
+    return None
+
+
+def _provider_label(provider: str) -> dict[str, str]:
+    target = get_target_by_id(provider)
+    if target:
+        return {
+            "name": target["name"],
+            "icon": target["icon"],
+            "color": target["color"],
+            "tag_color": target["tag_color"],
+        }
+    kind = provider_kind(provider)
+    base = PROVIDER_LABELS.get(kind, {"name": provider, "icon": "•", "color": "grey", "tag_color": "grey"})
+    name = base["name"] if provider == kind else f"{base['name']} ({provider})"
+    return {
+        "name": name,
+        "icon": base["icon"],
+        "color": base.get("color", "grey"),
+        "tag_color": base.get("tag_color", "blue"),
+    }
+
 
 
 def _display_tz() -> tzinfo:
@@ -369,7 +408,7 @@ def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
     格是独立 column，折行只会让那一格变高，不会牵动邻格。
     """
     provider = item["provider"]
-    label = PROVIDER_LABELS.get(provider, {"name": provider, "icon": "•", "color": "grey"})
+    label = _provider_label(provider)
     fields = item.get("fields") or {}
     status = item.get("status", "stale")
     captured = datetime.fromisoformat(item["captured_at"]).astimezone(_display_tz())
@@ -461,7 +500,7 @@ async def _notify(event: str, title: str, *, summary: str = "", subtitle: str = 
                 LOG.warning("notification image too large path=%s", path)
                 continue
             ref = f"screen-{index}"
-            caption = PROVIDER_LABELS.get(path.stem.split("-")[0], {}).get("name", path.stem)
+            caption = _provider_label(path.stem.split("-")[0]).get("name", path.stem)
             images.append({"ref": ref, "caption": f"{caption} 截图", "png_base64": __import__("base64").b64encode(raw).decode()})
             body_segments.append({"kind": "image", "image_ref": ref})
         except OSError:
@@ -650,11 +689,11 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         await page.reload(wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(int(PAGE_SETTLE_SECONDS * 1000))
         text = await page.locator("body").inner_text(timeout=15_000)
-        if provider == X_PROVIDER:
+        if provider_kind(provider) == "x" or provider == X_PROVIDER:
             fields, confidence, status = await _parse_posts(page, text)
         else:
             fields, confidence, status = _parse(provider, text)
-        if provider == "claude":
+        if provider_kind(provider) == "claude":
             meters = await page.locator("[role=meter][aria-valuenow][aria-valuemax='100']").evaluate_all(
                 "els => els.map(e => ({value:e.getAttribute('aria-valuenow'), text:e.getAttribute('aria-valuetext') || ''}))"
             )
@@ -690,7 +729,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     reset_detected = False
     limit_reset_detected = False
     old_fields: dict[str, Any] = {}
-    if provider != X_PROVIDER and previous and status == "healthy" and previous["status"] == "healthy":
+    if provider_kind(provider) != "x" and provider != X_PROVIDER and previous and status == "healthy" and previous["status"] == "healthy":
         try:
             old_fields = json.loads(previous["fields_json"] or "{}")
         except json.JSONDecodeError:
@@ -723,7 +762,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     # 观察位的告警按帖子去重：键用 status id，和额度那条重置事件走同一张表，
     # 因此过了保留期被清掉采集明细也不会重复推送。
     new_posts: list[dict[str, Any]] = []
-    if provider == X_PROVIDER and status == "healthy":
+    if (provider_kind(provider) == "x" or provider == X_PROVIDER) and status == "healthy":
         for item in alertable_posts(fields.get("posts", []), datetime.now(timezone.utc),
                                     keywords=X_KEYWORDS, max_age_hours=X_MAX_AGE_HOURS):
             if record_event_once(conn, f"x:{X_ACCOUNT}:{item['id']}", provider, captured_at, item):
@@ -736,7 +775,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     for item in new_posts:
         await _notify_post(item, screenshot_path)
     if reset_detected:
-        label = PROVIDER_LABELS.get(provider, {"name": provider, "icon": "•", "color": "grey"})
+        label = _provider_label(provider)
         # 与日报同样的理由：值会折行，不能用靠行数对齐的 section 三列。
         cells: list[dict[str, str]] = [{
             "name": "剩余",
@@ -762,7 +801,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             dedup_key=f"quota:weekly_reset:{provider}:{fields.get('weekly_reset_at','')}",
         )
     if limit_reset_detected:
-        label = PROVIDER_LABELS.get(provider, {"name": provider, "icon": "•", "color": "grey"})
+        label = _provider_label(provider)
         resets_avail = fields.get("resets_available", 1)
         cells = [{
             "name": "可用次数",
@@ -802,15 +841,22 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
     return result
 
 
-def _find_page(pages: list[Any], provider: str) -> Any | None:
-    """按 provider 找已经开着的标签页。
+def _find_page(pages: list[Any], target: dict[str, Any] | str) -> Any | None:
+    """按 target 找已经开着的标签页。
 
     ⚠️ 不能沿用「provider 名出现在 URL 里」这条通用规则：观察位的 provider 是
     ``x-<账号>``，而单字母 ``x`` 会命中任何含 x 的 URL。观察位按 ``x.com`` 域名匹配。
     """
-    if provider == X_PROVIDER:
+    if isinstance(target, str):
+        provider = target
+        kind = provider_kind(provider)
+    else:
+        provider = target["id"]
+        kind = target.get("kind", provider_kind(provider))
+
+    if kind == "x" or provider == X_PROVIDER:
         return next((p for p in pages if "x.com/" in p.url.lower()), None)
-    return next((p for p in pages if provider in p.url.lower()), None)
+    return next((p for p in pages if kind in p.url.lower()), None)
 
 
 async def _run() -> None:
@@ -820,30 +866,41 @@ async def _run() -> None:
             await asyncio.sleep(5)
             continue
         try:
+            targets = get_active_targets()
+            captured: list[dict[str, Any]] = []
+            targets_by_cdp: dict[str, list[dict[str, Any]]] = {}
+            for t in targets:
+                targets_by_cdp.setdefault(t["cdp_url"], []).append(t)
+
             async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp("http://127.0.0.1:9224")
-                context = browser.contexts[0] if browser.contexts else None
-                if context is None:
-                    raise RuntimeError("quota Chrome has no browser context")
-                pages = list(context.pages)
-                captured: list[dict[str, Any]] = []
-                targets = dict(PROVIDERS)
-                if X_PROVIDER:
-                    targets[X_PROVIDER] = X_URL
-                for provider, url in targets.items():
-                    page = _find_page(pages, provider)
-                    if page is None:
-                        page = await context.new_page()
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                        pages.append(page)
-                    elif provider == "claude" and "#settings/usage" not in page.url:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                    elif provider == "codex" and "/codex/cloud/settings/" not in page.url:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                    elif provider == X_PROVIDER and X_ACCOUNT.lower() not in page.url.lower():
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                    captured.append(await _capture(page, provider))
-                await _maybe_daily_report(captured)
+                for cdp_url, acc_list in targets_by_cdp.items():
+                    try:
+                        browser = await pw.chromium.connect_over_cdp(cdp_url)
+                        context = browser.contexts[0] if browser.contexts else None
+                        if context is None:
+                            LOG.warning("CDP endpoint %s has no browser context", cdp_url)
+                            continue
+                        pages = list(context.pages)
+                        for target in acc_list:
+                            provider = target["id"]
+                            kind = target["kind"]
+                            url = target["url"]
+                            page = _find_page(pages, target)
+                            if page is None:
+                                page = await context.new_page()
+                                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                                pages.append(page)
+                            elif kind == "claude" and "#settings/usage" not in page.url:
+                                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                            elif kind == "codex" and "/codex/cloud/settings/" not in page.url:
+                                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                            elif kind == "x" and X_ACCOUNT.lower() not in page.url.lower():
+                                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                            captured.append(await _capture(page, provider))
+                    except Exception as cdp_err:
+                        LOG.warning("cycle for cdp endpoint %s failed: %s: %s", cdp_url, type(cdp_err).__name__, cdp_err)
+                if captured:
+                    await _maybe_daily_report(captured)
                 # CDP attach 的 browser.close() 会关闭用户仍需查看的 Chrome；
                 # async with 退出时只结束 Playwright 连接，浏览器进程和手工登录态保持不动。
         except Exception as exc:
@@ -894,24 +951,24 @@ async def _maybe_daily_report(captured: list[dict[str, Any]]) -> None:
         conn.close()
     # ⚠️ 观察位不能进 _provider_segments：那个函数按「5h + 周额度」两格排版，
     # 传一条没有额度字段的记录进去会渲染出两格「暂无数据」。
-    quota_items = [item for item in captured if item["provider"] != X_PROVIDER]
-    watch_items = [item for item in captured if item["provider"] == X_PROVIDER]
+    quota_items = [item for item in captured if provider_kind(item["provider"]) != "x" and item["provider"] != X_PROVIDER]
+    watch_items = [item for item in captured if provider_kind(item["provider"]) == "x" or item["provider"] == X_PROVIDER]
     paths = [item["screenshot_path"] for item in quota_items if item.get("screenshot_path")]
     stamp = now
     segments = [seg for item in quota_items for seg in _provider_segments(item)]
     for item in watch_items:
         segments.extend(_watch_segments(item))
-    unhealthy = [item["provider"] for item in captured if item.get("status") != "healthy"]
+    unhealthy = [_provider_label(item["provider"]).get("name", item["provider"]) for item in captured if item.get("status") != "healthy"]
     if unhealthy:
         segments.append({
             "kind": "text",
             "text": f"<font color='red'>⚠️</font> 采集异常：{'、'.join(unhealthy)}，以截图为准。",
         })
     tags = [
-        {"text": PROVIDER_LABELS.get(item["provider"], {}).get("name", item["provider"]),
-         "color": PROVIDER_LABELS.get(item["provider"], {}).get("tag_color", "blue")}
+        {"text": _provider_label(item["provider"]).get("name", item["provider"]),
+         "color": _provider_label(item["provider"]).get("tag_color", "blue")}
         for item in captured
-    ][:3]
+    ][:4]
     await _notify(
         "quota.daily_report",
         "AI 额度日报",
@@ -939,14 +996,28 @@ async def shutdown() -> None:
 
 @app.get("/healthz")
 def healthz() -> dict[str, Any]:
-    cdp_ready = _cdp_ready()
+    targets = get_active_targets()
+    ports = sorted(set(t["cdp_port"] for t in targets)) or [9224]
+    port_statuses: dict[str, bool] = {}
+    for p in ports:
+        try:
+            try:
+                status = _cdp_ready(p)
+            except TypeError:
+                status = _cdp_ready()
+        except Exception:
+            status = False
+        port_statuses[str(p)] = status
+
+    all_ready = all(port_statuses.values()) if port_statuses else False
     result = {
-        "ok": cdp_ready,
+        "ok": all_ready,
         "attach_enabled": ENABLE_FILE.exists(),
-        "browser_cdp": cdp_ready,
+        "browser_cdp": all_ready,
+        "browser_cdp_ports": port_statuses,
         "db": str(DB_PATH),
     }
-    if not cdp_ready:
+    if not all_ready:
         raise HTTPException(status_code=503, detail=result)
     return result
 
@@ -1011,6 +1082,7 @@ def latest() -> dict[str, Any]:
     for row in rows:
         fields = json.loads(row["fields_json"] or "{}")
         public = _quota_public(fields)
+        label_info = _provider_label(row["provider"])
         providers[row["provider"]] = {
             "id": row["id"], "status": row["status"], "used": fields.get("used"),
             "remaining": fields.get("remaining"), "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
@@ -1018,6 +1090,7 @@ def latest() -> dict[str, Any]:
             "screenshot_url": _shot_url(row),
             "screenshot_captured_at": row["captured_at"], "confidence": row["confidence"],
             "text": row["text"], "error": row["error"],
+            "label": label_info.get("name", row["provider"]),
         }
         providers[row["provider"]].update(public)
     return {"providers": providers, "generated_at": _utc_now()}
@@ -1029,7 +1102,11 @@ def history(limit: int = 100) -> dict[str, Any]:
     conn = _db()
     rows = conn.execute("SELECT * FROM captures ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     conn.close()
-    result: dict[str, list[dict[str, Any]]] = {name: [] for name in PROVIDERS}
+    active_ids = [t["id"] for t in get_active_targets()]
+    result: dict[str, list[dict[str, Any]]] = {name: [] for name in active_ids}
+    for name in PROVIDERS:
+        if name not in result:
+            result[name] = []
     for row in rows:
         fields = json.loads(row["fields_json"] or "{}")
         public = _quota_public(fields)

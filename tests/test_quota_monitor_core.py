@@ -297,3 +297,81 @@ def test_normalize_reset_handles_month_day_and_time_without_year():
     # 跨年情况（已过去的月份顺延至次年）
     parsed_next_year = normalize_reset("Jan 5, 10:00 AM", now)
     assert parsed_next_year == datetime(2027, 1, 5, 10, 0, tzinfo=timezone.utc)
+
+
+def test_provider_kind_normalization():
+    from quota_monitor.core import provider_kind
+    assert provider_kind("codex") == "codex"
+    assert provider_kind("codex_sub") == "codex"
+    assert provider_kind("codex-work") == "codex"
+    assert provider_kind("claude") == "claude"
+    assert provider_kind("claude_2") == "claude"
+    assert provider_kind("x-thsottiaux") == "x"
+    assert provider_kind("custom") == "custom"
+
+
+def test_resolve_accounts_default_backward_compatible():
+    from quota_monitor.core import resolve_accounts
+    accounts = resolve_accounts(x_account="thsottiaux")
+    ids = [a["id"] for a in accounts]
+    assert ids == ["codex", "claude", "x-thsottiaux"]
+    assert accounts[0]["cdp_port"] == 9224
+    assert accounts[0]["name"] == "Codex"
+
+
+def test_resolve_accounts_multiple_codex_comma_separated():
+    from quota_monitor.core import resolve_accounts
+    raw = "codex:9224:alice,codex_sub:9225:bob@company.com"
+    accounts = resolve_accounts(raw_codex_accounts=raw, x_account="thsottiaux")
+    ids = [a["id"] for a in accounts]
+    assert ids == ["codex", "codex_sub", "claude", "x-thsottiaux"]
+    assert accounts[0]["name"] == "Codex (alice)"
+    assert accounts[0]["cdp_port"] == 9224
+    assert accounts[1]["name"] == "Codex (bob)"
+    assert accounts[1]["cdp_port"] == 9225
+
+
+def test_resolve_accounts_multiple_codex_short_format():
+    from quota_monitor.core import resolve_accounts
+    raw = "alice:9224,bob:9225"
+    accounts = resolve_accounts(raw_codex_accounts=raw, include_claude=False)
+    assert len(accounts) == 2
+    assert accounts[0]["name"] == "Codex (alice)"
+    assert accounts[0]["cdp_port"] == 9224
+    assert accounts[1]["name"] == "Codex (bob)"
+    assert accounts[1]["cdp_port"] == 9225
+
+
+def test_clean_account_label():
+    from quota_monitor.core import clean_account_label
+    assert clean_account_label("alice") == "Codex (alice)"
+    assert clean_account_label("alice@gmail.com") == "Codex (alice)"
+    assert clean_account_label("Codex (bob)") == "Codex (bob)"
+    assert clean_account_label("Codex (bob@corp.com)") == "Codex (bob)"
+    assert clean_account_label("Codex") == "Codex"
+
+
+def test_get_chrome_instances_single_and_multiple():
+    from quota_monitor.core import get_chrome_instances, resolve_accounts
+    # 单账号：单个实例全屏，使用根 profile
+    single_accounts = resolve_accounts()
+    single_inst = get_chrome_instances(single_accounts, "/data/profiles")
+    assert len(single_inst) == 1
+    assert single_inst[0]["port"] == 9224
+    assert single_inst[0]["profile_dir"] == "/data/profiles"
+    assert single_inst[0]["size"] == "1366,768"
+    assert "https://chatgpt.com/codex" in single_inst[0]["urls"]
+    assert "https://claude.ai/" in single_inst[0]["urls"]
+
+    # 多账号：两个实例分屏，首个在 0,0，次个在 680,0，子目录隔离
+    multi_accounts = resolve_accounts(raw_codex_accounts="codex:9224:alice,codex_sub:9225:bob")
+    multi_inst = get_chrome_instances(multi_accounts, "/data/profiles")
+    assert len(multi_inst) == 2
+    assert multi_inst[0]["port"] == 9224
+    assert multi_inst[0]["profile_dir"] == "/data/profiles"
+    assert multi_inst[0]["pos"] == "0,0"
+    assert multi_inst[0]["size"] == "680,768"
+    assert multi_inst[1]["port"] == 9225
+    assert multi_inst[1]["profile_dir"] == "/data/profiles/account_9225"
+    assert multi_inst[1]["pos"] == "680,0"
+    assert multi_inst[1]["size"] == "680,768"

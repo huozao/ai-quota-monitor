@@ -404,3 +404,265 @@ def alertable_posts(posts: list[dict[str, Any]], now: datetime, *,
         and post_is_fresh(post.get("posted_at"), now, max_age_hours)
     ]
     return sorted(picked, key=lambda item: str(item.get("posted_at") or ""))
+
+
+# ---- 多账号与浏览器配置解析 --------------------------------------------------
+
+def provider_kind(provider: str) -> str:
+    """归一化 provider 标识为基础平台类型 ('codex', 'claude', 或 'x')。"""
+    lowered = str(provider or "").lower().strip()
+    if lowered.startswith("x-") or lowered.startswith("x:") or lowered == "x":
+        return "x"
+    for base in ("codex", "claude", "agy"):
+        if lowered == base or lowered.startswith(f"{base}_") or lowered.startswith(f"{base}-") or lowered.startswith(f"{base}:"):
+            return base
+    return lowered
+
+
+def clean_account_label(raw: str) -> str:
+    """从配置提取展示名称，截取用户名或邮箱前缀，格式化为 Codex (<name>)。"""
+    name = str(raw or "").strip()
+    if not name:
+        return "Codex"
+    match = re.search(r"Codex\s*\(([^)]+)\)", name, flags=re.I)
+    if match:
+        inner = match.group(1).strip()
+        if "@" in inner:
+            inner = inner.split("@")[0].strip()
+        return f"Codex ({inner})"
+    if "@" in name:
+        name = name.split("@")[0].strip()
+    if name.lower() == "codex":
+        return "Codex"
+    return f"Codex ({name})"
+
+
+def parse_codex_account_entry(entry: Any, default_port: int = 9224, index: int = 0) -> dict[str, Any]:
+    """解析单个 Codex 账号配置（支持字典或字符串）。"""
+    if isinstance(entry, dict):
+        raw_id = str(entry.get("id") or ("codex" if index == 0 else f"codex_{entry.get('port', default_port)}")).strip()
+        account_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id.split("@")[0]).strip("_") or "codex"
+        port = int(entry.get("port") or entry.get("cdp_port") or default_port)
+        name = clean_account_label(entry.get("name") or account_id)
+        url = str(entry.get("url") or "https://chatgpt.com/codex/cloud/settings/usage").strip()
+        return {
+            "id": account_id,
+            "kind": "codex",
+            "name": name,
+            "cdp_port": port,
+            "cdp_url": f"http://127.0.0.1:{port}",
+            "url": url,
+            "icon": "֎",
+            "color": "blue",
+            "tag_color": "blue",
+        }
+
+    text = str(entry or "").strip()
+    if not text:
+        return {}
+    parts = [p.strip() for p in text.split(":") if p.strip()]
+    if len(parts) == 1:
+        clean_user = parts[0].split("@")[0].strip()
+        account_id = "codex" if index == 0 else f"codex_{clean_user}"
+        name = clean_account_label(parts[0])
+        port = default_port
+    elif len(parts) == 2:
+        if parts[0].isdigit():
+            port = int(parts[0])
+            label_part = parts[1]
+        elif parts[1].isdigit():
+            label_part = parts[0]
+            port = int(parts[1])
+        else:
+            label_part = parts[0]
+            port = default_port
+        clean_user = re.sub(r"[^a-zA-Z0-9_-]", "_", label_part.split("@")[0]).strip("_")
+        account_id = "codex" if (index == 0 and port == 9224) else f"codex_{clean_user or port}"
+        name = clean_account_label(label_part)
+    else:
+        raw_id = parts[0]
+        account_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id.split("@")[0]).strip("_") or "codex"
+        port = int(parts[1]) if parts[1].isdigit() else default_port
+        raw_name = ":".join(parts[2:])
+        name = clean_account_label(raw_name)
+
+    return {
+        "id": account_id,
+        "kind": "codex",
+        "name": name,
+        "cdp_port": port,
+        "cdp_url": f"http://127.0.0.1:{port}",
+        "url": "https://chatgpt.com/codex/cloud/settings/usage",
+        "icon": "֎",
+        "color": "blue",
+        "tag_color": "blue",
+    }
+
+
+def resolve_accounts(
+    raw_accounts: str | None = None,
+    raw_codex_accounts: str | None = None,
+    x_account: str | None = None,
+    include_claude: bool = True,
+) -> list[dict[str, Any]]:
+    """解析完整的采集目标账号列表，保持对单账号部署的 100% 向后兼容。"""
+    if raw_accounts and raw_accounts.strip():
+        text = raw_accounts.strip()
+        if text.startswith("[") or text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                if isinstance(parsed, list):
+                    results: list[dict[str, Any]] = []
+                    for i, item in enumerate(parsed):
+                        if not isinstance(item, dict):
+                            continue
+                        acc_id = str(item.get("id") or f"target_{i+1}")
+                        kind = str(item.get("kind") or provider_kind(acc_id))
+                        port = int(item.get("port") or item.get("cdp_port") or 9224)
+                        name = str(item.get("name") or acc_id)
+                        icon = str(item.get("icon") or ("֎" if kind == "codex" else ("✴️" if kind == "claude" else "•")))
+                        color = str(item.get("color") or ("blue" if kind == "codex" else ("orange" if kind == "claude" else "grey")))
+                        tag_color = str(item.get("tag_color") or color)
+                        url = str(item.get("url") or (
+                            "https://chatgpt.com/codex/cloud/settings/usage" if kind == "codex" else
+                            ("https://claude.ai/settings/usage" if kind == "claude" else "")
+                        ))
+                        results.append({
+                            "id": acc_id,
+                            "kind": kind,
+                            "name": name,
+                            "cdp_port": port,
+                            "cdp_url": f"http://127.0.0.1:{port}",
+                            "url": url,
+                            "icon": icon,
+                            "color": color,
+                            "tag_color": tag_color,
+                        })
+                    if results:
+                        return results
+            except json.JSONDecodeError:
+                pass
+
+    codex_targets: list[dict[str, Any]] = []
+    if raw_codex_accounts and raw_codex_accounts.strip():
+        text = raw_codex_accounts.strip()
+        if text.startswith("[") or text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    parsed = [parsed]
+                if isinstance(parsed, list):
+                    for i, item in enumerate(parsed):
+                        target = parse_codex_account_entry(item, 9224 + i, i)
+                        if target:
+                            codex_targets.append(target)
+            except json.JSONDecodeError:
+                pass
+        if not codex_targets:
+            entries = [e.strip() for e in text.split(",") if e.strip()]
+            for i, entry in enumerate(entries):
+                target = parse_codex_account_entry(entry, 9224 + i, i)
+                if target:
+                    codex_targets.append(target)
+
+    if not codex_targets:
+        codex_targets = [{
+            "id": "codex",
+            "kind": "codex",
+            "name": "Codex",
+            "cdp_port": 9224,
+            "cdp_url": "http://127.0.0.1:9224",
+            "url": "https://chatgpt.com/codex/cloud/settings/usage",
+            "icon": "֎",
+            "color": "blue",
+            "tag_color": "blue",
+        }]
+
+    results = list(codex_targets)
+
+    if include_claude:
+        results.append({
+            "id": "claude",
+            "kind": "claude",
+            "name": "Claude",
+            "cdp_port": 9224,
+            "cdp_url": "http://127.0.0.1:9224",
+            "url": "https://claude.ai/settings/usage",
+            "icon": "✴️",
+            "color": "orange",
+            "tag_color": "orange",
+        })
+
+    x_clean = str(x_account or "").strip().lstrip("@")
+    if x_clean:
+        results.append({
+            "id": f"x-{x_clean}",
+            "kind": "x",
+            "name": f"@{x_clean}",
+            "cdp_port": 9224,
+            "cdp_url": "http://127.0.0.1:9224",
+            "url": f"https://x.com/{x_clean}",
+            "icon": "📣",
+            "color": "wathet",
+            "tag_color": "orange",
+        })
+
+    return results
+
+
+def get_chrome_instances(accounts: list[dict[str, Any]], profile_root: str = "/app/quota_browser_data") -> list[dict[str, Any]]:
+    """根据账号的 CDP 端口列表生成 Chrome 进程启动参数。"""
+    ports: list[int] = []
+    accounts_by_port: dict[int, list[dict[str, Any]]] = {}
+    for acc in accounts:
+        p = int(acc.get("cdp_port") or 9224)
+        if p not in accounts_by_port:
+            ports.append(p)
+            accounts_by_port[p] = []
+        accounts_by_port[p].append(acc)
+
+    instances: list[dict[str, Any]] = []
+    total = len(ports)
+    for idx, port in enumerate(ports):
+        accs = accounts_by_port[port]
+        # 端口 9224 永远使用 root 目录，保证现有单账号历史登录凭证完好保留。
+        # 其他独立端口在 profile_root 下创建子目录。
+        if port == 9224:
+            profile_dir = profile_root
+        else:
+            profile_dir = f"{profile_root.rstrip('/')}/account_{port}"
+
+        if total == 1:
+            pos = "0,0"
+            size = "1366,768"
+        else:
+            pos = f"{(idx * 680) % 1360},0"
+            size = "680,768"
+
+        urls: list[str] = []
+        kinds_seen: set[str] = set()
+        for acc in accs:
+            k = acc["kind"]
+            if k in kinds_seen:
+                continue
+            kinds_seen.add(k)
+            if k == "codex":
+                urls.append("https://chatgpt.com/codex")
+            elif k == "claude":
+                urls.append("https://claude.ai/")
+            elif k == "x":
+                urls.append(acc["url"])
+        if not urls:
+            urls = ["https://chatgpt.com/codex"]
+
+        instances.append({
+            "port": port,
+            "profile_dir": profile_dir,
+            "pos": pos,
+            "size": size,
+            "urls": urls,
+        })
+
+    return instances
