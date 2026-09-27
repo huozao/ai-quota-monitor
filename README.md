@@ -109,6 +109,17 @@ items in `tags`. In multi-account setups, `quota_monitor/app.py` automatically
 caps `tags` to the first 3 items (`tags[:3]`) to ensure daily report delivery
 is never rejected with HTTP 422.
 
+### Host Topology & Integration
+
+- **Collector & API Host (`webdock2`)**:
+  - Runs the `quota-monitor` Docker container exposing port 8000.
+  - Manages isolated Chrome instances per account (CDP 9224 for primary `codex`, 9225 for `codex_2`).
+  - Renders weekly quota remaining trend charts on the fly via Pillow (`quota_monitor/chart.py`) and serves `/v1/quota/providers/{provider}/trend.png`.
+  - Dispatches scheduled and on-demand daily reports to the notification hub (`NOTIFY_API_URL`, e.g. `http://txecs:18000/v1/notify`).
+- **Edge & Notification Hub (`txecs`)**:
+  - Serves the web console at `https://hydwang.xyz/console/quota/` (managed by `infra/roles/server/tencent/files/console-quota.html`), proxying `/console/quota/api/*` to `webdock2:8000`.
+  - Runs the notify center backend (`business-cn-backend-api-1`), handling Feishu image uploads and rendering the Card 2.0 dual collapsible panels for `quota.daily_report` events.
+
 ## Run locally
 
 ```bash
