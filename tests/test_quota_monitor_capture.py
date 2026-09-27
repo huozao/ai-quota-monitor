@@ -453,3 +453,42 @@ def test_weekly_trend_chart_and_endpoint(tmp_path: Path, monkeypatch: Any) -> No
     assert resp.media_type == "image/png"
     assert resp.body.startswith(b"\x89PNG\r\n\x1a\n")
     conn.close()
+
+
+def test_purge_page_memory_with_cdp_session() -> None:
+    sent_commands: list[str] = []
+    detached = False
+
+    class _CDPSession:
+        async def send(self, command: str) -> None:
+            sent_commands.append(command)
+
+        async def detach(self) -> None:
+            nonlocal detached
+            detached = True
+
+    class _Context:
+        async def new_cdp_session(self, page: object) -> _CDPSession:
+            return _CDPSession()
+
+    class _PageWithContext:
+        def __init__(self) -> None:
+            self.context = _Context()
+
+    page = _PageWithContext()
+    asyncio.run(quota_app._purge_page_memory(page))
+    assert "HeapProfiler.collectGarbage" in sent_commands
+    assert "Memory.forciblyPurgeJavaScriptMemory" in sent_commands
+    assert detached is True
+
+
+def test_purge_page_memory_handles_missing_context() -> None:
+    # 模拟 FakePage 等无 context 属性对象，确保不抛出异常
+    class _PageNoContext:
+        pass
+
+    asyncio.run(quota_app._purge_page_memory(_PageNoContext()))
+
+
+def test_setup_subreaper_safe() -> None:
+    quota_app._setup_subreaper()

@@ -92,6 +92,52 @@ _task: asyncio.Task[None] | None = None
 _stop = asyncio.Event()
 
 
+def _setup_subreaper() -> None:
+    """在 Linux 下将当前进程设为子进程收割者（subreaper），并处理 SIGCHLD。
+
+    避免 Chrome 包装脚本等产生的孤儿进程变为无法被 reap 的 defunct 僵尸进程。
+    """
+    try:
+        import ctypes
+        import signal
+
+        prctl = getattr(ctypes.CDLL(None), "prctl", None)
+        if prctl is not None:
+            # PR_SET_CHILD_SUBREAPER = 36
+            prctl(36, 1, 0, 0, 0)
+
+        if hasattr(signal, "SIGCHLD"):
+            def _sigchld_reaper(signum: int, frame: Any) -> None:
+                while True:
+                    try:
+                        pid, _ = os.waitpid(-1, os.WNOHANG)
+                        if pid <= 0:
+                            break
+                    except ChildProcessError:
+                        break
+
+            signal.signal(signal.SIGCHLD, _sigchld_reaper)
+    except Exception:
+        pass
+
+
+_setup_subreaper()
+
+
+async def _purge_page_memory(page: Any) -> None:
+    """采集完成后主动触发 V8 垃圾回收并清除未使用的 Native 内存缓存，避免长存标签页内存膨胀。"""
+    context = getattr(page, "context", None)
+    if context is None or not hasattr(context, "new_cdp_session"):
+        return
+    try:
+        session = await context.new_cdp_session(page)
+        await session.send("HeapProfiler.collectGarbage")
+        await session.send("Memory.forciblyPurgeJavaScriptMemory")
+        await session.detach()
+    except Exception:
+        pass
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -959,6 +1005,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             screenshot_paths=[screenshot_path] if screenshot_path else [],
             dedup_key=f"quota:limit_reset:{provider}:{resets_avail}:{fields.get('resets_expires_at', '')}",
         )
+    await _purge_page_memory(page)
     return result
 
 

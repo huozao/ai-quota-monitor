@@ -109,6 +109,23 @@ items in `tags`. In multi-account setups, `quota_monitor/app.py` automatically
 caps `tags` to the first 3 items (`tags[:3]`) to ensure daily report delivery
 is never rejected with HTTP 422.
 
+### Memory footprint and process hygiene
+
+Automated scraping of complex single-page applications (SPAs) over prolonged periods
+can lead to significant renderer memory bloat and zombie process buildup:
+
+1. **Chrome Resource Constraints**: Browser instances are launched with `--mute-audio`,
+   `--disable-audio-output`, `--js-flags=--max-old-space-size=512`,
+   `--disable-features=OmniboxPopupAimWebUI,OptimizationHints,MediaRouter,Translate`, and
+   `--renderer-process-limit=2`. This disables unneeded background services (e.g. audio mojom,
+   internal omnibox WebUIs) and sets a firm V8 heap ceiling.
+2. **Active Post-Capture Memory Purge**: After each collection cycle, `_purge_page_memory` sends
+   `HeapProfiler.collectGarbage` and `Memory.forciblyPurgeJavaScriptMemory` via CDP to flush
+   fragmented heap memory and unused layout resources from long-lived SPA tabs.
+3. **Child Subreaper Hygiene**: `app.py` registers the main process as a child subreaper via
+   `prctl(PR_SET_CHILD_SUBREAPER)` and handles `SIGCHLD` to automatically reap any orphaned child
+   processes (such as Chrome `cat` wrappers) without leaving defunct zombies.
+
 ### Host Topology & Integration
 
 - **Collector & API Host (`webdock2`)**:

@@ -76,7 +76,16 @@ for inst in instances:
     --disable-dev-shm-usage --no-sandbox \
     "--window-position=${pos}" \
     "--window-size=${size}" \
-    --disable-blink-features=AutomationControlled
+    --disable-blink-features=AutomationControlled \
+    --mute-audio \
+    --disable-audio-output \
+    '--js-flags=--max-old-space-size=512' \
+    '--disable-features=OmniboxPopupAimWebUI,OptimizationHints,MediaRouter,Translate' \
+    --renderer-process-limit=2 \
+    --disable-background-networking \
+    --disable-component-update \
+    --disable-sync \
+    --disable-domain-reliability
   )
   if [ -n "${CHROME_PROXY_SERVER:-}" ]; then
     chrome_args+=("--proxy-server=${CHROME_PROXY_SERVER}")
