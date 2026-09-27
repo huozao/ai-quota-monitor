@@ -36,6 +36,19 @@ In daily report cards, manual resets and credits are rendered as compact notatio
 footnotes below the metrics grid, keeping provider title headers (`֎ Codex`, `✴️ Claude`, `∩ AGY`)
 clean, symmetrical, and uncluttered.
 
+## Weekly limit trends and notification cards
+
+The monitor tracks remaining quota progression over a 7-day rolling window:
+- **Descending Remaining Curve**: Displays weekly limit progression declining from 100% downward, with reset jump markers (`♻ 周重置`) when quotas are replenished back to 100%.
+- **Render Engine**: Generated via Pillow (`quota_monitor/chart.py`) using 2x Retina supersampling downsampled with Lanczos filtering, dark theme (`#0b1220`), and CJK font support.
+- **Endpoints**: Accessible at `/v1/quota/providers/{provider}/trend.png` and `/console/quota/api/providers/{provider}/trend.png`.
+- **Card ViewModel**: `build_quota_card` embeds `trend_url` alongside `screenshot_url`, ensuring the web console and notification channels share a unified model. Redundant "额度充足" labels are omitted when 5h quota is at 100%.
+- **Dual Collapsible Panels**: In Feishu daily report cards, visual evidence is organized into two collapsible panels (`collapsible_panel`, default collapsed):
+  1. `📈 点击展开周限额趋势图 (N 张)`
+  2. `🖥️ 点击展开页面现场截图 (N 张)`
+  This keeps message cards compact while allowing one-click expansion and native high-resolution image preview.
+- **Consistent Ordering**: Accounts are strictly ordered as Codex primary (`codex`) → Codex secondary (`codex_2`) → Claude (`claude`) → X watch (`x-thsottiaux`) across report text, trend charts, screenshots, and web console tabs.
+
 ## Multi-account support
 
 To monitor multiple Codex accounts within the same container, configure `QUOTA_CODEX_ACCOUNTS`

@@ -16,10 +16,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from patchright.async_api import async_playwright
 
+from .chart import generate_weekly_trend_chart
 from .core import (
     alertable_posts,
     claude_reset_sections,
@@ -398,28 +399,56 @@ def _metric_cell(name: str, remaining: Any, note: str, color: str = "") -> dict[
     return cell
 
 
-def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
-    """一个平台两段：一行标题 + 一行两格指标。
+def build_quota_card(item: dict[str, Any]) -> dict[str, Any]:
+    """构建通用的卡片展示模型（Card ViewModel），供飞书卡片与网页端通用。
 
-    ⚠️ 不要用 ``section`` 三列排这个。中枢的 section 把指标名和指标值各拼成**一个**
-    markdown 块靠行数对齐，值一旦折行两列就整体错位——2026-09-07 实测卡片里
-    「Credits」对到了上一行的值上。流量日报不出问题是因为它的值短到不折行，而额度
-    这边「85% 剩余 · 9/14 10:33 · 6天22小时后」在半屏宽下必然折行。``fields`` 的每一
-    格是独立 column，折行只会让那一格变高，不会牵动邻格。
+    展示逻辑全在此处收敛：
+    1. 标题与图标（🟢 Codex / 🟣 Claude / 🐦 @thsottiaux）；
+    2. 5h 与周限额指标（数值、红/绿状态色、单行紧凑倒计时与副状态）；
+    3. 附加信息条（状态异常高亮、💡 重置额度及到期时间、Credits）；
+    4. 采集元信息与截图。
     """
-    provider = item["provider"]
+    provider = item.get("provider", "")
+    kind = provider_kind(provider)
     label = _provider_label(provider)
     fields = item.get("fields") or {}
     status = item.get("status", "stale")
-    captured = datetime.fromisoformat(item["captured_at"]).astimezone(_display_tz())
+    captured_at = item.get("captured_at")
 
+    captured_fmt = ""
+    if captured_at:
+        try:
+            moment = datetime.fromisoformat(str(captured_at)).astimezone(_display_tz())
+            captured_fmt = moment.strftime("%Y/%m/%d %H:%M")
+        except Exception:
+            captured_fmt = str(captured_at)
+
+    screenshot_url = item.get("screenshot_url")
+
+    # X 观察位卡片模型
+    if kind == "x" or provider == X_PROVIDER:
+        account = fields.get("account") or X_ACCOUNT
+        posts = fields.get("posts") or []
+        return {
+            "provider": provider,
+            "kind": "watch",
+            "icon": "🐦",
+            "title": f"@{account}" if account else label["name"],
+            "status": status,
+            "status_label": STATUS_LABELS.get(status, status),
+            "status_color": "ok" if status == "healthy" else "warn",
+            "account": account,
+            "posts": posts,
+            "meta": f"采集：{captured_fmt} · 重置预告观察位" if captured_fmt else "重置预告观察位",
+            "screenshot_url": screenshot_url,
+        }
+
+    # 常规额度卡片模型
     weekly_remaining = fields.get("weekly_remaining")
     weekly_left = percent(weekly_remaining)
     five_remaining = fields.get("remaining")
     five_left = percent(five_remaining)
-    # 页面在窗口没用满时不给它自己的重置时间，这不是缺数据。周额度耗尽时 5 小时窗口
-    # 有额度也用不了，那一行要说清楚在等谁。
-    # 只有真拿到重置时间才写「重置 …」；拿不到就说明页面这一格没给，不人为推算。
+
     if fields.get("session_state") == "idle":
         five_note = "会话未开始"
     elif fields.get("reset_at"):
@@ -427,52 +456,121 @@ def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
     elif weekly_left is not None and weekly_left <= 0:
         five_note = "等待周额度重置"
     elif five_left is not None and five_left >= 100:
-        five_note = "额度充足"
+        five_note = ""
     else:
         five_note = ""
 
     weekly_reset = _reset_phrase(fields, "weekly_reset_at")
-    segments: list[dict[str, Any]] = [
+
+    metrics = [
         {
-            "kind": "text",
-            "text": f"**{label['icon']} {label['name']}**",
+            "key": "5h",
+            "label": "5h",
+            "value": five_remaining if five_remaining is not None else "暂无数据",
+            "color": _quota_color(five_left),
+            "note": five_note,
+            "reset_at_iso": fields.get("reset_at_iso"),
+            "reset_at": fields.get("reset_at"),
         },
         {
-            "kind": "fields",
-            "fields": [
-                _metric_cell("5h", five_remaining, five_note, _quota_color(five_left)),
-                _metric_cell(
-                    "周额度",
-                    weekly_remaining,
-                    f"重置 {weekly_reset}" if weekly_reset else "",
-                    _quota_color(weekly_left),
-                ),
-            ],
+            "key": "weekly",
+            "label": "周额度",
+            "value": weekly_remaining if weekly_remaining is not None else "暂无数据",
+            "color": _quota_color(weekly_left),
+            "note": f"重置 {weekly_reset}" if weekly_reset else "",
+            "reset_at_iso": fields.get("weekly_reset_at_iso"),
+            "reset_at": fields.get("weekly_reset_at"),
         },
     ]
 
-    extra_notes: list[str] = []
+    extra_notes: list[dict[str, str]] = []
     if status != "healthy":
-        extra_notes.append(f"<font color='red'>{STATUS_LABELS.get(status, status)}</font>")
+        status_text = STATUS_LABELS.get(status, status)
+        extra_notes.append({
+            "key": "status",
+            "text": status_text,
+            "color": "red",
+            "feishu_text": f"<font color='red'>{status_text}</font>",
+            "html": f"<span style='color:var(--warn)'>{status_text}</span>",
+        })
+
     resets_avail = fields.get("resets_available")
     if resets_avail is not None and int(resets_avail or 0) > 0:
         resets_num = int(resets_avail)
         exp_phrase = _reset_phrase(fields, "resets_expires_at")
         exp_suffix = f" ({exp_phrase.split(' · ')[0]} 到期)" if exp_phrase else ""
-        extra_notes.append(
-            f"<font color='grey'>💡 重置额度 </font><font color='green'>**{resets_num}**</font><font color='grey'> 次{exp_suffix}</font>"
-        )
-    if fields.get("credits_remaining") is not None:
-        extra_notes.append(f"<font color='grey'>Credits {fields['credits_remaining']}</font>")
+        reset_text = f"💡 重置额度 {resets_num} 次{exp_suffix}"
+        extra_notes.append({
+            "key": "resets",
+            "text": reset_text,
+            "color": "green",
+            "feishu_text": f"<font color='grey'>💡 重置额度 </font><font color='green'>**{resets_num}**</font><font color='grey'> 次{exp_suffix}</font>",
+            "html": f"💡 重置额度 <strong style='color:var(--ok)'>{resets_num}</strong> 次{exp_suffix}",
+        })
 
-    if extra_notes:
+    if fields.get("credits_remaining") is not None:
+        credits_val = fields["credits_remaining"]
+        credits_text = f"Credits {credits_val}"
+        extra_notes.append({
+            "key": "credits",
+            "text": credits_text,
+            "color": "grey",
+            "feishu_text": f"<font color='grey'>{credits_text}</font>",
+            "html": f"<span style='color:var(--muted)'>{credits_text}</span>",
+        })
+
+    conf_str = f"{round(float(item['confidence']) * 100)}%" if item.get("confidence") is not None else "—"
+    win_str = fields.get("window") or "—"
+    meta_parts = []
+    if captured_fmt:
+        meta_parts.append(f"采集：{captured_fmt}")
+    meta_parts.append(f"窗口：{win_str}")
+    meta_parts.append(f"解析置信度：{conf_str}")
+    meta_text = " · ".join(meta_parts)
+
+    return {
+        "provider": provider,
+        "kind": "quota",
+        "icon": label.get("icon", "•"),
+        "title": label.get("name", provider),
+        "status": status,
+        "status_label": STATUS_LABELS.get(status, status),
+        "status_color": "ok" if status == "healthy" else "warn",
+        "metrics": metrics,
+        "extra_notes": extra_notes,
+        "meta": meta_text,
+        "screenshot_url": screenshot_url,
+        "trend_url": f"{PUBLIC_API_PREFIX}/providers/{provider}/trend.png",
+    }
+
+
+def _provider_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """一个平台两段：一行标题 + 一行两格指标（直接消费 build_quota_card 保证与网页完全对齐）。"""
+    card = build_quota_card(item)
+    label_text = f"**{card['icon']} {card['title']}**"
+    metric_cells = []
+    for m in card["metrics"]:
+        val_color = m.get("color")
+        val_str = f"<font color='{val_color}'>**{m['value']}**</font>" if val_color else f"**{m['value']}**"
+        cell = {"name": m["label"], "value": val_str}
+        if m.get("note"):
+            cell["note"] = f"<font color='grey'>{m['note']}</font>"
+        metric_cells.append(cell)
+
+    segments: list[dict[str, Any]] = [
+        {"kind": "text", "text": label_text},
+        {"kind": "fields", "fields": metric_cells},
+    ]
+
+    extra_parts = [e.get("feishu_text", e["text"]) for e in card.get("extra_notes", [])]
+    if extra_parts:
         segments.append({
             "kind": "fields",
             "fields": [
                 {
                     "name": "",
                     "value": "",
-                    "note": " <font color='grey'>·</font> ".join(extra_notes),
+                    "note": " <font color='grey'>·</font> ".join(extra_parts),
                 }
             ],
         })
@@ -500,8 +598,13 @@ async def _notify(event: str, title: str, *, summary: str = "", subtitle: str = 
                 LOG.warning("notification image too large path=%s", path)
                 continue
             ref = f"screen-{index}"
-            caption = _provider_label(path.stem.split("-")[0]).get("name", path.stem)
-            images.append({"ref": ref, "caption": f"{caption} 截图", "png_base64": __import__("base64").b64encode(raw).decode()})
+            provider_key = path.stem.replace("-trend", "").split("-")[0]
+            label = _provider_label(provider_key).get("name", provider_key)
+            if "-trend" in path.stem or "trend" in path.name:
+                caption = f"{label} 周限额趋势"
+            else:
+                caption = f"{label} 截图"
+            images.append({"ref": ref, "caption": caption, "png_base64": base64.b64encode(raw).decode()})
             body_segments.append({"kind": "image", "image_ref": ref})
         except OSError:
             continue
@@ -787,6 +890,24 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         if next_reset:
             cells.append({"name": "下次重置", "value": f"**{next_reset}**"})
         moment = datetime.fromisoformat(captured_at).astimezone(_display_tz())
+        reset_paths: list[Path] = []
+        if screenshot_path and Path(screenshot_path).is_file():
+            reset_paths.append(Path(screenshot_path))
+        try:
+            conn_trend = _db()
+            trend_bytes = generate_weekly_trend_chart(
+                provider=provider,
+                conn=conn_trend,
+                title_label=label.get("name", provider),
+                days=RETENTION_DAYS,
+                tz=_display_tz(),
+            )
+            conn_trend.close()
+            trend_path = SCREENSHOT_DIR / f"{provider}-trend.png"
+            trend_path.write_bytes(trend_bytes)
+            reset_paths.append(trend_path)
+        except Exception as exc:
+            LOG.warning("failed to generate trend chart on reset provider=%s: %s", provider, exc)
         await _notify(
             "quota.reset",
             f"{label['name']} 周额度已重置",
@@ -797,7 +918,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
                 {"kind": "text", "text": f"**♻️ {label['name']} 周额度**"},
                 {"kind": "fields", "fields": cells},
             ],
-            screenshot_paths=[screenshot_path] if screenshot_path else [],
+            screenshot_paths=reset_paths,
             dedup_key=f"quota:weekly_reset:{provider}:{fields.get('weekly_reset_at','')}",
         )
     if limit_reset_detected:
@@ -966,9 +1087,36 @@ async def _maybe_daily_report(captured: list[dict[str, Any]]) -> None:
         conn.close()
     # ⚠️ 观察位不能进 _provider_segments：那个函数按「5h + 周额度」两格排版，
     # 传一条没有额度字段的记录进去会渲染出两格「暂无数据」。
+    active_ids = [t["id"] for t in get_active_targets()]
     quota_items = [item for item in captured if provider_kind(item["provider"]) != "x" and item["provider"] != X_PROVIDER]
+    quota_items.sort(key=lambda x: active_ids.index(x["provider"]) if x["provider"] in active_ids else 999)
     watch_items = [item for item in captured if provider_kind(item["provider"]) == "x" or item["provider"] == X_PROVIDER]
-    paths = [item["screenshot_path"] for item in quota_items if item.get("screenshot_path")]
+    trend_paths: list[Path] = []
+    shot_paths: list[Path] = []
+    conn_rep = _db()
+    try:
+        for item in quota_items:
+            provider = item["provider"]
+            try:
+                trend_bytes = generate_weekly_trend_chart(
+                    provider=provider,
+                    conn=conn_rep,
+                    title_label=_provider_label(provider).get("name", provider),
+                    days=RETENTION_DAYS,
+                    tz=_display_tz(),
+                )
+                trend_path = SCREENSHOT_DIR / f"{provider}-trend.png"
+                trend_path.write_bytes(trend_bytes)
+                trend_paths.append(trend_path)
+            except Exception as trend_err:
+                LOG.warning("failed to generate trend chart for %s: %s", provider, trend_err)
+            if item.get("screenshot_path"):
+                p = Path(item["screenshot_path"])
+                if p.is_file():
+                    shot_paths.append(p)
+    finally:
+        conn_rep.close()
+    paths = trend_paths + shot_paths
     stamp = now
     segments = [seg for item in quota_items for seg in _provider_segments(item)]
     for item in watch_items:
@@ -1098,17 +1246,24 @@ def latest() -> dict[str, Any]:
         fields = json.loads(row["fields_json"] or "{}")
         public = _quota_public(fields)
         label_info = _provider_label(row["provider"])
-        providers[row["provider"]] = {
-            "id": row["id"], "status": row["status"], "used": fields.get("used"),
+        shot = _shot_url(row)
+        item_data = {
+            "id": row["id"], "provider": row["provider"], "status": row["status"], "used": fields.get("used"),
             "remaining": fields.get("remaining"), "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
             "window": fields.get("window", ""), "reset_at": fields.get("reset_at"),
-            "screenshot_url": _shot_url(row),
+            "screenshot_url": shot,
             "screenshot_captured_at": row["captured_at"], "confidence": row["confidence"],
             "text": row["text"], "error": row["error"],
             "label": label_info.get("name", row["provider"]),
+            "icon": label_info.get("icon", "•"),
+            "color": label_info.get("color", "grey"),
+            "fields": fields, "captured_at": row["captured_at"],
         }
-        providers[row["provider"]].update(public)
-    return {"providers": providers, "generated_at": _utc_now()}
+        item_data.update(public)
+        item_data["card"] = build_quota_card(item_data)
+        providers[row["provider"]] = item_data
+    active_ids = [t["id"] for t in get_active_targets()]
+    return {"providers": providers, "provider_order": active_ids, "generated_at": _utc_now()}
 
 
 @app.get("/v1/quota/history")
@@ -1125,16 +1280,24 @@ def history(limit: int = 100) -> dict[str, Any]:
     for row in rows:
         fields = json.loads(row["fields_json"] or "{}")
         public = _quota_public(fields)
-        result.setdefault(row["provider"], []).append({
-            "id": row["id"], "captured_at": row["captured_at"], "status": row["status"],
+        label_info = _provider_label(row["provider"])
+        shot = _shot_url(row)
+        item_data = {
+            "id": row["id"], "provider": row["provider"], "captured_at": row["captured_at"], "status": row["status"],
             "used": fields.get("used"), "remaining": fields.get("remaining"),
             "unit": "%" if any("%" in str(v) for v in fields.values()) else "",
             "window": fields.get("window", ""), "reset_at": fields.get("reset_at"),
-            "screenshot_url": _shot_url(row),
+            "screenshot_url": shot,
             "confidence": row["confidence"], "error": row["error"],
-        })
-        result[row["provider"]][-1].update(public)
-    return {"providers": result, "generated_at": _utc_now()}
+            "label": label_info.get("name", row["provider"]),
+            "icon": label_info.get("icon", "•"),
+            "color": label_info.get("color", "grey"),
+            "fields": fields,
+        }
+        item_data.update(public)
+        item_data["card"] = build_quota_card(item_data)
+        result.setdefault(row["provider"], []).append(item_data)
+    return {"providers": result, "provider_order": active_ids, "generated_at": _utc_now()}
 
 
 @app.get("/v1/quota/captures/{capture_id}/screenshot")
@@ -1146,3 +1309,22 @@ def screenshot(capture_id: int) -> FileResponse:
     if not row or not row["screenshot_path"] or not Path(row["screenshot_path"]).is_file():
         raise HTTPException(status_code=404, detail="screenshot not found")
     return FileResponse(row["screenshot_path"], media_type="image/png")
+
+
+@app.get("/v1/quota/providers/{provider}/trend.png")
+@app.get("/console/quota/api/providers/{provider}/trend.png")
+def provider_trend(provider: str, days: int = 7) -> Response:
+    days = max(1, min(days, 30))
+    conn = _db()
+    try:
+        label = _provider_label(provider).get("name", provider)
+        png_bytes = generate_weekly_trend_chart(
+            provider=provider,
+            conn=conn,
+            title_label=label,
+            days=days,
+            tz=_display_tz(),
+        )
+        return Response(content=png_bytes, media_type="image/png", headers={"Cache-Control": "no-cache, max-age=60"})
+    finally:
+        conn.close()

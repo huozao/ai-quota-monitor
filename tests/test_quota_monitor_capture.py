@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -338,3 +339,117 @@ def test_page_matches_and_find_page():
     assert quota_app._find_page(pages, {"id": "codex", "kind": "codex"}) is p_chatgpt
     assert quota_app._find_page(pages, {"id": "claude", "kind": "claude"}) is p_claude
     assert quota_app._find_page(pages, {"id": "x-thsottiaux", "kind": "x"}) is p_x
+
+
+def test_build_quota_card_and_history_card_model(data_dir):
+    # 构建测试用的额度 item
+    item = {
+        "provider": "codex",
+        "status": "healthy",
+        "captured_at": "2026-09-27T10:00:00+08:00",
+        "confidence": 0.95,
+        "screenshot_url": "/v1/quota/captures/1/screenshot",
+        "fields": {
+            "remaining": "100%",
+            "weekly_remaining": "0%",
+            "weekly_reset_at": "Sep 28, 2026 2:24 AM",
+            "weekly_reset_at_iso": "2026-09-28T02:24:00+08:00",
+            "resets_available": 1,
+            "resets_expires_at": "Oct 22, 6:31 PM",
+            "resets_expires_at_iso": "2026-10-22T18:31:00+08:00",
+            "credits_remaining": 441,
+        },
+    }
+    card = quota_app.build_quota_card(item)
+
+    assert card["provider"] == "codex"
+    assert card["kind"] == "quota"
+    assert card["icon"] == "֎"
+    assert card["title"] == "Codex"
+    assert card["status"] == "healthy"
+    assert card["status_label"] == "正常"
+    assert card["status_color"] == "ok"
+
+    # 指标：5h 与 周额度
+    metrics = {m["key"]: m for m in card["metrics"]}
+    assert metrics["5h"]["value"] == "100%"
+    assert metrics["5h"]["color"] == "green"
+    assert metrics["5h"]["note"] == "等待周额度重置"  # 周限额为 0% 时
+
+    assert metrics["weekly"]["value"] == "0%"
+    assert metrics["weekly"]["color"] == "red"
+    assert "重置" in metrics["weekly"]["note"]
+
+    # 附加信息：重置额度 与 Credits
+    extra_keys = [e["key"] for e in card["extra_notes"]]
+    assert "resets" in extra_keys
+    assert "credits" in extra_keys
+    resets_note = next(e for e in card["extra_notes"] if e["key"] == "resets")
+    assert "💡 重置额度 1 次" in resets_note["text"]
+    assert resets_note["color"] == "green"
+
+    # 验证 history() API 会包含 card 与 provider_order
+    page = FakePage(CODEX_WITH_LIMIT_RESETS, screenshot_fails=0)
+    asyncio.run(quota_app._capture(page, "codex"))
+
+    history_data = quota_app.history(limit=10)
+    assert "provider_order" in history_data
+    assert "codex" in history_data["providers"]
+    first = history_data["providers"]["codex"][0]
+    assert "card" in first
+    assert first["card"]["title"] == "Codex"
+    assert len(first["card"]["metrics"]) == 2
+    assert "trend_url" in first["card"]
+    assert first["card"]["trend_url"].endswith("/providers/codex/trend.png")
+
+
+def test_weekly_trend_chart_and_endpoint(tmp_path: Path, monkeypatch: Any) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(quota_app, "DATA_DIR", data_dir)
+    monkeypatch.setattr(quota_app, "DB_PATH", data_dir / "quota.sqlite3")
+    monkeypatch.setattr(quota_app, "SCREENSHOT_DIR", data_dir / "screenshots")
+
+    from quota_monitor.chart import extract_weekly_points, generate_weekly_trend_chart
+
+    conn = quota_app._db()
+    # 1. 空数据测试
+    points_empty = extract_weekly_points(conn, "codex", days=7)
+    assert points_empty == []
+    empty_png = generate_weekly_trend_chart("codex", conn, title_label="Codex", days=7)
+    assert empty_png.startswith(b"\x89PNG\r\n\x1a\n")
+
+    # 2. 插入模拟周限额下降与跃升数据点
+    now_utc = datetime.now(timezone.utc)
+    mock_records = [
+        (now_utc - timedelta(days=5), {"weekly_remaining": "100%"}),
+        (now_utc - timedelta(days=4), {"weekly_remaining": "85%"}),
+        (now_utc - timedelta(days=3), {"weekly_remaining": "60%"}),
+        (now_utc - timedelta(days=2), {"weekly_remaining": "15%"}),
+        (now_utc - timedelta(days=1), {"weekly_remaining": "100%"}),  # 周重置跃升
+        (now_utc - timedelta(hours=6), {"weekly_remaining": "78%"}),
+    ]
+    for dt, flds in mock_records:
+        conn.execute(
+            """
+            INSERT INTO captures(provider, captured_at, url, text, fields_json, status, confidence)
+            VALUES (?, ?, 'https://test', 'text', ?, 'healthy', 1.0)
+            """,
+            ("codex", dt.isoformat(), json.dumps(flds)),
+        )
+    conn.commit()
+
+    points = extract_weekly_points(conn, "codex", days=7)
+    assert len(points) == 6
+    assert points[0][1] == 100.0
+    assert points[-1][1] == 78.0
+
+    chart_png = generate_weekly_trend_chart("codex", conn, title_label="Codex", days=7)
+    assert chart_png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(chart_png) > 5000
+
+    # 3. 验证 API 端点
+    resp = quota_app.provider_trend("codex", days=7)
+    assert resp.media_type == "image/png"
+    assert resp.body.startswith(b"\x89PNG\r\n\x1a\n")
+    conn.close()
