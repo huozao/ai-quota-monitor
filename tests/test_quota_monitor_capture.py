@@ -492,3 +492,33 @@ def test_purge_page_memory_handles_missing_context() -> None:
 
 def test_setup_subreaper_safe() -> None:
     quota_app._setup_subreaper()
+
+
+def test_codex_loading_state_prevents_false_limit_reset(data_dir, monkeypatch):
+    notifications = []
+
+    async def fake_notify(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(quota_app, "_notify", fake_notify)
+
+    # 1. 正常采集：已有 1 次重置额度
+    page_normal = FakePage(CODEX_WITH_LIMIT_RESETS, screenshot_fails=0)
+    res1 = asyncio.run(quota_app._capture(page_normal, "codex"))
+    assert res1["status"] == "healthy"
+    assert res1["fields"]["resets_available"] == 1
+    notifications.clear()
+
+    # 2. 模拟偶发残缺：页面处于 "Loading usage data"，仅渲染了静态 Credits: 0
+    loading_text = "Codex and Work Analytics\n\nLoading usage data\n\nCredits remaining\n\n0\n"
+    page_loading = FakePage(loading_text, screenshot_fails=0)
+    res_loading = asyncio.run(quota_app._capture(page_loading, "codex"))
+    assert res_loading["status"] == "loading"
+    assert res_loading["limit_reset_detected"] is False
+
+    # 3. 下一轮恢复正常：页面重新解析出 1 次重置额度
+    res3 = asyncio.run(quota_app._capture(page_normal, "codex"))
+    assert res3["status"] == "healthy"
+    # 关键断言：不得误触发获得新重置通知！
+    assert res3["limit_reset_detected"] is False
+    assert len(notifications) == 0

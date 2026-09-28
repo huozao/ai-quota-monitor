@@ -74,6 +74,7 @@ def limit_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | No
     2. 当前可用重置次数 > 0；
     3. 可用次数较上一轮增加（例如 0 -> 1，或 1 -> 2）；
     4. 或可用次数未变（> 0）但到期时间更新（上一批已刷新/换成了新的一批）。
+    若上一轮缺失 resets_available 字段，仅当上一轮包含有效核心限额（如 weekly_remaining 或 remaining）证明为完整页面时才视作之前 0 次；若核心限额也缺失，视为残缺数据不予触发。
     使用掉重置（次数减少）或次数与到期时间不变时绝不告警。
     """
     if not previous or current.get("status") != "healthy" or previous.get("status") != "healthy":
@@ -81,9 +82,14 @@ def limit_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | No
     now_fields = current.get("fields", {})
     old_fields = previous.get("fields", {})
     now_count = int(now_fields.get("resets_available") or 0)
-    old_count = int(old_fields.get("resets_available") or 0)
     if now_count <= 0:
         return False
+    if "resets_available" not in old_fields:
+        if not (old_fields.get("weekly_remaining") or old_fields.get("remaining")):
+            return False
+        old_count = 0
+    else:
+        old_count = int(old_fields.get("resets_available") or 0)
     if now_count > old_count:
         return True
     now_exp = now_fields.get("resets_expires_at")

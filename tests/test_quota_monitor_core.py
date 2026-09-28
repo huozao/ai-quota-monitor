@@ -262,9 +262,13 @@ def test_limit_reset_candidate_triggers_on_increase_or_new_expiry():
     new = {"status": "healthy", "fields": {"resets_available": 1, "resets_expires_at": "Oct 22, 6:31 PM"}}
     assert limit_reset_candidate(new, old)
 
-    # 之前没有该字段（旧版本升级场景），只要新采集有可用次数即触发
+    # 之前没有该字段且无核心限额（如残缺数据/空字典），不触发告警
     old_untracked = {"status": "healthy", "fields": {}}
-    assert limit_reset_candidate(new, old_untracked)
+    assert not limit_reset_candidate(new, old_untracked)
+
+    # 之前是完整页面（含核心限额）但无重置区块（0 次状态），出现新重置时触发
+    old_with_limits = {"status": "healthy", "fields": {"weekly_remaining": "80%"}}
+    assert limit_reset_candidate(new, old_with_limits)
 
     # 次数进一步增加
     newer = {"status": "healthy", "fields": {"resets_available": 2, "resets_expires_at": "Oct 22, 6:31 PM"}}

@@ -197,6 +197,8 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
     lowered = text.lower()
     if any(x in lowered for x in ("log in", "sign in", "登录", "登录后")):
         return {}, 0.0, "auth_required"
+    if any(x in lowered for x in ("loading usage data", "loading usage...", "loading data")):
+        return {}, 0.0, "loading"
     if provider_kind(provider) == "codex":
         fields: dict[str, Any] = {}
         five_hour = re.search(r"5\s*hour\s*usage\s*limit\s*([\d,.]+\s*%)\s*remaining", text, flags=re.I | re.S)
@@ -250,6 +252,9 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
             type_match = re.search(r"((?:full|weekly|5[\s-]*hour)\s*reset[^\n]*)", resets_section, flags=re.I)
             if type_match:
                 fields["resets_type"] = type_match.group(1).strip()
+        if not (five_hour or weekly):
+            status = "loading" if "loading" in lowered else "partial"
+            return fields, 0.3, status
         return fields, min(1.0, 0.6 + 0.1 * len(fields)) if fields else 0.0, "healthy" if fields else "schema_changed"
     fields: dict[str, Any] = {}
     patterns = {
@@ -872,7 +877,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         digest = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
     conn = _db()
     previous = conn.execute(
-        "SELECT fields_json, status FROM captures WHERE provider=? ORDER BY id DESC LIMIT 1", (provider,)
+        "SELECT fields_json, status FROM captures WHERE provider=? AND status='healthy' ORDER BY id DESC LIMIT 1", (provider,)
     ).fetchone()
     reset_key = f"{provider}:{fields.get('reset_at','')}" if fields.get("reset_at") else None
     reset_detected = False
