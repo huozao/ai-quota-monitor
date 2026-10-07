@@ -173,3 +173,28 @@ services:
   - `loading`：页面正在加载中（网络延迟），下一轮轮询会自动重试。
   - `auth_required`：页面重定向至登录墙，需人工在 noVNC 重新认证。
   - `schema_changed`：未识别到任何有效字段，页面结构发生彻底变更。
+
+---
+
+## 7. 典型案例与设计意图 (Case Studies)
+
+### 案例 1：2026-10 ChatGPT 额度页改版与小节锚定
+- **现象**：国庆停电后重启，日报中 Codex 账号显示「5h: 暂无数据，周额度: 暂无数据，partial」，但现场截图实际显示完整额度。
+- **根因**：OpenAI 调整了前端 DOM 文本渲染：
+  - 5h 小节由旧版 `5-hour usage limit` 变为 `5-hour limit\nResets in <time>\n<num>% left`。
+  - 周限额小节由旧版 `Weekly limit` 变为同构的 `Weekly limit\nResets in <time>\n<num>% left`。
+  - 原正则按 `remaining` 匹配导致漏检 `left`，且全页首条 `Resets in` 会因小节未锚定而错位。
+- **解法**：
+  1. `quota_monitor/core.py` 中的 `CODEX_SECTIONS` 支持元组多候选标记：`("five_hour", ("5-hour limit", "5-hour usage limit"))`。
+  2. `section_resets` 动态搜索首个匹配标记并确定各小节文本块区间。
+  3. `quota_monitor/app.py` 优先从小节块中按 `(?:remaining|left)` 提取剩余百分比，并支持 Credits 数值前置/后置。
+
+### 案例 2：观察位（@thsottiaux）动态双语呈现
+- **设计意图**：针对 X 观察位的发布动态，英文保留为主要展示文本，中文翻译作为辅助说明。
+- **排版约定**：
+  - 飞书卡片：正文为主，中文设为浅灰细字 `<font color='grey'>翻译：{text_zh}</font>`。
+  - 网页控制台（`https://hydwang.xyz/console/quota/`）：主段落展示英文原文，下方附 `<p class="post-zh" style="color:var(--muted);font-size:.82rem;margin:2px 0 6px;line-height:1.45;">翻译：${text_zh}</p>`。
+- **翻译通道**：通过 `translate.googleapis.com` 请求（受 `CHROME_PROXY_SERVER` 路由代理保护），采用内存 LRU 缓存（256 条）避免重复调用与网络抖动。
+
+### 案例 3：容器刚重启首轮采集的 SPA 渲染延迟
+- **实测观察**：容器冷启动后首轮采集可能因 Chrome 9225 尚未完成首屏 JS 水合（DOM innerText 暂时为空）返回单次 `partial`。进入正常轮询（或等待 5 秒 settle）后自动转为 `healthy`（置信度 100%）。无需手动清库或反复重启，让定时轮询自然衔接即可。

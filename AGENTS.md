@@ -9,9 +9,10 @@ to standalone clones; a private parent workspace is not required for local work.
 - [README.md](README.md): purpose, security boundary, retention, and local setup.
 - [docs/deployment-webdock2.md](docs/deployment-webdock2.md): webdock2 host topology, multi-account config, and recovery runbook.
 - `quota_monitor/core.py`: reset parsing, normalization, event deduplication, and watch filters.
+- `quota_monitor/translate.py`: watch post Chinese translation via Google Translate with cache and proxy.
 - `quota_monitor/chart.py`: weekly remaining limit trend chart generation (Pillow) with reset jump detection.
 - `quota_monitor/app.py`: API, collection lifecycle, capture evidence, storage, and retention.
-- `tests/`: parser, capture, retention, and watch regression tests.
+- `tests/`: parser, capture, retention, watch, and translation regression tests.
 - `docker-compose.yml`, `Dockerfile`, `docker/quota-entrypoint.sh`: generic runtime examples.
 
 ## Boundaries

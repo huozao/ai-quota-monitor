@@ -24,6 +24,16 @@ Posts are stored with the same retention as captures; only posts that match
 `QUOTA_X_KEYWORDS` and are newer than `QUOTA_X_MAX_AGE_HOURS` raise a notification,
 deduplicated by post id so a restart never re-sends one.
 
+### Translation for watch posts
+
+Posts captured from the watch timeline are automatically translated to Chinese using
+`quota_monitor/translate.py` (via `translate.googleapis.com` through `CHROME_PROXY_SERVER`,
+with an in-memory LRU cache of 256 items and an 8-second timeout).
+In both Feishu notification cards and the web console (`https://hydwang.xyz/console/quota/`),
+posts display the original English text as the primary content, followed by the Chinese translation
+in subtle light grey small text (`<font color='grey'>` in Feishu markdown, `color: var(--muted); font-size: .82rem` in HTML).
+
+
 ## Usage limit resets
 
 For Codex (ChatGPT), the collector parses the "Usage limit resets" section in
@@ -131,12 +141,12 @@ can lead to significant renderer memory bloat and zombie process buildup:
 ### Host Topology & Integration
 
 - **Collector & API Host (`webdock2`)**:
-  - Runs the `quota-monitor` Docker container exposing port 8000.
+  - Runs the `quota-monitor` Docker container (internal port 8001 -> host port 18002).
   - Manages isolated Chrome instances per account (CDP 9224 for primary `codex`, 9225 for `codex_2`).
   - Renders weekly quota remaining trend charts on the fly via Pillow (`quota_monitor/chart.py`) and serves `/v1/quota/providers/{provider}/trend.png`.
-  - Dispatches scheduled and on-demand daily reports to the notification hub (`NOTIFY_API_URL`, e.g. `http://txecs:18000/v1/notify`).
+  - Dispatches scheduled and on-demand daily reports to the notification hub (`NOTIFY_ENDPOINT`, e.g. `http://host.docker.internal:18020/v1/internal/notify/send`).
 - **Edge & Notification Hub (`txecs`)**:
-  - Serves the web console at `https://hydwang.xyz/console/quota/` (managed by `infra/roles/server/tencent/files/console-quota.html`), proxying `/console/quota/api/*` to `webdock2:8000`.
+  - Serves the web console at `https://hydwang.xyz/console/quota/` (managed by `infra/roles/server/tencent/files/console-quota.html`), proxying `/console/quota/api/*` to `webdock2:18002` via SSH tunnel.
   - Runs the notify center backend (`business-cn-backend-api-1`), handling Feishu image uploads and rendering the Card 2.0 dual collapsible panels for `quota.daily_report` events.
 
 ## Run locally
