@@ -7,6 +7,7 @@ to standalone clones; a private parent workspace is not required for local work.
 ## Entry points
 
 - [README.md](README.md): purpose, security boundary, retention, and local setup.
+- [docs/deployment-webdock2.md](docs/deployment-webdock2.md): webdock2 host topology, multi-account config, and recovery runbook.
 - `quota_monitor/core.py`: reset parsing, normalization, event deduplication, and watch filters.
 - `quota_monitor/chart.py`: weekly remaining limit trend chart generation (Pillow) with reset jump detection.
 - `quota_monitor/app.py`: API, collection lifecycle, capture evidence, storage, and retention.

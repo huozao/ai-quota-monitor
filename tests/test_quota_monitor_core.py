@@ -379,3 +379,31 @@ def test_get_chrome_instances_single_and_multiple():
     assert multi_inst[1]["profile_dir"] == "/data/profiles/account_9225"
     assert multi_inst[1]["pos"] == "680,0"
     assert multi_inst[1]["size"] == "680,768"
+
+
+def test_codex_new_sections_anchored_and_relative_resets():
+    from datetime import datetime, timezone
+    from quota_monitor.core import codex_reset_sections, normalize_reset
+
+    text = (
+        "5-hour limit\n"
+        "Resets in 5h 1m\n"
+        "100% left\n"
+        "Weekly limit\n"
+        "Resets in 3d 20h\n"
+        "66% left\n"
+        "Credits\n"
+        "Buy credits or turn on automatic reload to continue using Work and Codex when you reach usage limits. Learn more\n"
+        "748 credits remaining\n"
+    )
+    res = codex_reset_sections(text)
+    assert res["anchored"] is True
+    assert res["five_hour_reset"] == "5h 1m"
+    assert res["weekly_reset"] == "3d 20h"
+
+    now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+    t_5h = normalize_reset(res["five_hour_reset"], now)
+    assert t_5h == datetime(2026, 10, 6, 17, 1, tzinfo=timezone.utc)
+
+    t_weekly = normalize_reset(res["weekly_reset"], now)
+    assert t_weekly == datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)

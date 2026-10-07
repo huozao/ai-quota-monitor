@@ -195,3 +195,37 @@ def test_daily_report_line_survives_empty_and_missing_fields():
         segments = quota_app._watch_segments(item)
         assert len(segments) == 1
         assert "24h 内无重置相关动态" in segments[0]["text"]
+
+
+def test_daily_report_line_with_translation():
+    post = _fresh("All reset for everyone", "111")
+    post["text_zh"] = "所有人全部重置"
+    segments = quota_app._watch_segments(_captured([post]))
+    assert len(segments) == 2
+    assert "All reset for everyone" in segments[0]["text"]
+    assert "翻译：所有人全部重置" in segments[1]["text"]
+    assert "<font color='grey'>" in segments[1]["text"]
+
+
+def test_notify_x_post_includes_grey_chinese_translation(monkeypatch):
+    sent = []
+
+    async def fake_notify(*args, **kwargs):
+        sent.append((args, kwargs))
+
+    monkeypatch.setattr(quota_app, "_notify", fake_notify)
+
+    item = {
+        "id": "12345",
+        "url": "https://x.com/thsottiaux/status/12345",
+        "posted_at": "2026-10-06T07:13:54.000Z",
+        "author": "@thsottiaux",
+        "text": "Auto-review is now free",
+        "text_zh": "自动审核现已免费",
+    }
+    asyncio.run(quota_app._notify_post(item, None))
+    assert len(sent) == 1
+    args, kwargs = sent[0]
+    segments = kwargs["segments"]
+    assert any("Auto-review is now free" in s["text"] for s in segments)
+    assert any("翻译：自动审核现已免费" in s["text"] and "<font color='grey'>" in s["text"] for s in segments)

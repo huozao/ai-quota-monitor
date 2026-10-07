@@ -6,6 +6,8 @@ text plus screenshots as evidence, and exposes a small FastAPI read API.
 
 For code entry points, local tests, and contribution boundaries, see
 [AGENTS.md](AGENTS.md). [CLAUDE.md](CLAUDE.md) is a compatibility entry to the same rules.
+For production host deployment topology, multi-account setup, and recovery runbooks, see
+[docs/deployment-webdock2.md](docs/deployment-webdock2.md).
 
 ## Security boundary
 

@@ -522,3 +522,80 @@ def test_codex_loading_state_prevents_false_limit_reset(data_dir, monkeypatch):
     # 关键断言：不得误触发获得新重置通知！
     assert res3["limit_reset_detected"] is False
     assert len(notifications) == 0
+
+
+def test_codex_new_schema_2026_10_capture_and_card(data_dir, monkeypatch):
+    notifications = []
+
+    async def fake_notify(*args, **kwargs):
+        notifications.append((args, kwargs))
+
+    monkeypatch.setattr(quota_app, "_notify", fake_notify)
+
+    raw_text_4059 = (
+        "5-hour limit\n"
+        "Resets in 5h 1m\n"
+        "100% left\n"
+        "Weekly limit\n"
+        "Resets in 3d 20h\n"
+        "66% left\n"
+        "Credits\n"
+        "Buy credits or turn on automatic reload to continue using Work and Codex when you reach usage limits. Learn more\n"
+        "748 credits remaining\n"
+        "Current balance\n"
+        "Add more\n"
+        "Automatic reload\n"
+        "Usage limit resets\n"
+        "Use a reset to restore your 5-hour limit, weekly limit, or both\n"
+        "Available\n"
+        "2\n"
+        "History\n"
+        "Full reset (Weekly + 5 hr)\n"
+        "Expires October 22\n"
+    )
+
+    page = FakePage(raw_text_4059, screenshot_fails=0)
+    capture = asyncio.run(quota_app._capture(page, "codex"))
+    assert capture["status"] == "healthy"
+    fields = capture["fields"]
+    assert fields["remaining"] == "100%"
+    assert fields["used"] == "0%"
+    assert fields["weekly_remaining"] == "66%"
+    assert fields["weekly_used_percent"] == "34%"
+    assert fields["credits_remaining"] == "748"
+    assert fields["reset_at"] == "5h 1m"
+    assert fields["weekly_reset_at"] == "3d 20h"
+    assert fields["resets_available"] == 2
+    assert fields["resets_expires_at"] == "October 22"
+    assert fields.get("weekly_reset_at_iso") is not None
+    assert fields.get("reset_at_iso") is not None
+
+    card = quota_app.build_quota_card(capture)
+    assert card["status"] == "healthy"
+    assert card["metrics"][0]["value"] == "100%"
+    assert card["metrics"][1]["value"] == "66%"
+    assert any("💡 重置额度" in note["text"] for note in card["extra_notes"])
+    assert any("Credits 748" in note["text"] for note in card["extra_notes"])
+
+    # 测试无重置次数的辅助账号 (Capture 4062 结构)
+    raw_text_4062 = (
+        "5-hour limit\n"
+        "Resets in 1h 16m\n"
+        "100% left\n"
+        "Weekly limit\n"
+        "Resets in 4d 17h\n"
+        "21% left\n"
+        "Credits\n"
+        "0 credits remaining\n"
+        "Usage limit resets\n"
+        "Available\n"
+        "0\n"
+    )
+    page_sub = FakePage(raw_text_4062, screenshot_fails=0)
+    capture_sub = asyncio.run(quota_app._capture(page_sub, "codex_2"))
+    assert capture_sub["status"] == "healthy"
+    fields_sub = capture_sub["fields"]
+    assert fields_sub["remaining"] == "100%"
+    assert fields_sub["weekly_remaining"] == "21%"
+    assert fields_sub["credits_remaining"] == "0"
+    assert fields_sub["resets_available"] == 0

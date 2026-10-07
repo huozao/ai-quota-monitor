@@ -102,11 +102,18 @@ def limit_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | No
 _RESET_LINE = re.compile(r"resets?\s+(?:in\s+|at\s+|after\s+)?([^\n]{1,80})", re.I)
 _SESSION_IDLE = "starts when a message is sent"
 # 小节边界。最后一项只当边界用（credits 的重置与额度窗口无关，必须被切在外面）。
-CLAUDE_SECTIONS = (("session", "current session"), ("weekly", "weekly limits"), ("", "usage credits"))
-CODEX_SECTIONS = (("five_hour", "5 hour usage limit"), ("weekly", "weekly usage limit"), ("", "credits remaining"))
+# 小节边界。最后一项只当边界用（credits 的重置与额度窗口无关，必须被切在外面）。
+CLAUDE_SECTIONS = (("session", ("current session",)), ("weekly", ("weekly limits",)), ("", ("usage credits",)))
+CODEX_SECTIONS = (
+    ("five_hour", ("5-hour limit", "5 hour limit", "5 hour usage limit", "5-hour usage limit")),
+    ("weekly", ("weekly limit", "weekly usage limit")),
+    ("", ("credits remaining", "\ncredits", "credits")),
+)
 
 
-def section_resets(text: str, sections: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+def section_resets(
+    text: str, sections: tuple[tuple[str, str | tuple[str, ...]], ...]
+) -> dict[str, Any]:
     """按小节边界取各窗口的重置时间，不按出现顺序取。
 
     ⚠️ 位置取值（``findall`` 之后 ``[0]`` 当 5 小时、``[1]`` 当周）在**某个窗口不渲染
@@ -118,14 +125,22 @@ def section_resets(text: str, sections: tuple[tuple[str, str], ...]) -> dict[str
     返回 ``{"anchored": bool, "<key>": "重置文案或 None", "blocks": {...}}``。
     """
     lowered = text.lower()
-    positions: list[tuple[str, int]] = []
+    positions: list[tuple[str, int, int]] = []
     cursor = 0
-    for key, marker in sections:
-        index = lowered.find(marker, cursor)
-        if index < 0:
+    for key, markers in sections:
+        marker_candidates = (markers,) if isinstance(markers, str) else markers
+        best_idx = -1
+        best_len = 0
+        for m in marker_candidates:
+            idx = lowered.find(m.lower(), cursor)
+            if idx >= 0:
+                if best_idx < 0 or idx < best_idx:
+                    best_idx = idx
+                    best_len = len(m)
+        if best_idx < 0:
             continue
-        positions.append((key, index))
-        cursor = index + len(marker)
+        positions.append((key, best_idx, best_len))
+        cursor = best_idx + best_len
     result: dict[str, Any] = {"anchored": False, "blocks": {}}
     for key, _ in sections:
         if key:
@@ -134,8 +149,8 @@ def section_resets(text: str, sections: tuple[tuple[str, str], ...]) -> dict[str
     if len(named) < len([key for key, _ in sections if key]):
         return result
     result["anchored"] = True
-    ends = [index for _, index in positions[1:]] + [len(text)]
-    for (key, start), end in zip(positions, ends):
+    ends = [index for _, index, _ in positions[1:]] + [len(text)]
+    for (key, start, _), end in zip(positions, ends):
         if not key:
             continue
         block = text[start:end]

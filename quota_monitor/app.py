@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from patchright.async_api import async_playwright
 
 from .chart import generate_weekly_trend_chart
+from .translate import translate_text
 from .core import (
     alertable_posts,
     claude_reset_sections,
@@ -201,12 +202,35 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
         return {}, 0.0, "loading"
     if provider_kind(provider) == "codex":
         fields: dict[str, Any] = {}
-        five_hour = re.search(r"5\s*hour\s*usage\s*limit\s*([\d,.]+\s*%)\s*remaining", text, flags=re.I | re.S)
-        weekly = re.search(r"weekly\s*usage\s*limit\s*([\d,.]+\s*%)\s*remaining", text, flags=re.I | re.S)
-        credits = re.search(r"credits\s*remaining\s*([\d,.]+)", text, flags=re.I | re.S)
         # 重置时间按小节边界取。页面在某个窗口还没用满时不渲染该窗口的 Resets 行，
         # 全页第一条 Resets 因此可能属于任何一个窗口。
         resets = codex_reset_sections(text)
+        five_block = resets.get("blocks", {}).get("five_hour", "")
+        weekly_block = resets.get("blocks", {}).get("weekly", "")
+
+        # 优先从小节块中提取剩余额度（支持 100% remaining 与 100% left）；若小节未锚定则全页正则容错回退
+        five_hour = re.search(r"([\d,.]+\s*%)\s*(?:remaining|left)", five_block, flags=re.I) if five_block else None
+        if not five_hour:
+            five_hour = re.search(
+                r"5[\s-]*hour(?:\s*usage)?\s*limit.*?([\d,.]+\s*%)\s*(?:remaining|left)",
+                text,
+                flags=re.I | re.S,
+            )
+
+        weekly = re.search(r"([\d,.]+\s*%)\s*(?:remaining|left)", weekly_block, flags=re.I) if weekly_block else None
+        if not weekly:
+            weekly = re.search(
+                r"weekly(?:\s*usage)?\s*limit.*?([\d,.]+\s*%)\s*(?:remaining|left)",
+                text,
+                flags=re.I | re.S,
+            )
+
+        # Credits 提取：支持「credits remaining 0」以及「748 credits remaining」
+        credits = re.search(
+            r"(?:credits\s*remaining\s*([\d,.]+)|([\d,.]+)\s*credits\s*remaining)",
+            text,
+            flags=re.I,
+        )
         if five_hour:
             remaining = five_hour.group(1).strip()
             try:
@@ -223,7 +247,7 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
             except ValueError:
                 pass
         if credits:
-            fields["credits_remaining"] = credits.group(1).strip()
+            fields["credits_remaining"] = (credits.group(1) or credits.group(2)).strip()
         # ⚠️ 该写法自 2026-09-07 起改正：此前把周重置时间同时写进 reset_at，看板「5 小时
         # 限额」格子于是显示的是周重置时间，读起来像 5 小时窗口要等到那一刻。
         if resets["five_hour_reset"]:
@@ -334,8 +358,14 @@ async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str
         if "sign in" in lowered or "log in" in lowered or "登录" in lowered:
             return {}, 0.0, "auth_required"
         return {}, 0.0, "schema_changed"
-    for item in posts:
+    async def _attach_meta(item: dict[str, Any]) -> None:
         item["is_reset"] = is_reset_post(item["text"], X_KEYWORDS)
+        if item.get("text"):
+            item["text_zh"] = await translate_text(item["text"])
+        else:
+            item["text_zh"] = None
+
+    await asyncio.gather(*[_attach_meta(p) for p in posts])
     return {"account": X_ACCOUNT, "posts": posts}, 0.9, "healthy"
 
 
@@ -815,17 +845,24 @@ async def _notify_post(item: dict[str, Any], screenshot_path: Path | None) -> No
     body = item["text"].strip().replace("\n", " ")
     if len(body) > 300:
         body = body[:300] + "…"
+    segments = [
+        {"kind": "text", "text": f"**📣 @{item.get('author') or X_ACCOUNT}**　<font color='grey'>{stamp}</font>"},
+        {"kind": "text", "text": body},
+    ]
+    zh_body = (item.get("text_zh") or "").strip().replace("\n", " ")
+    if zh_body:
+        if len(zh_body) > 300:
+            zh_body = zh_body[:300] + "…"
+        segments.append({"kind": "text", "text": f"<font color='grey'>翻译：{zh_body}</font>"})
+    segments.append({"kind": "text", "text": f"<font color='grey'>{item['url']}</font>"})
+
     await _notify(
         "quota.x_post",
         f"@{X_ACCOUNT} 发布重置相关动态",
         subtitle=f"发布于 {stamp} · {TZ_LABEL}",
         level="warn",
         tags=[{"text": "重置预告", "color": "orange"}],
-        segments=[
-            {"kind": "text", "text": f"**📣 @{item.get('author') or X_ACCOUNT}**　<font color='grey'>{stamp}</font>"},
-            {"kind": "text", "text": body},
-            {"kind": "text", "text": f"<font color='grey'>{item['url']}</font>"},
-        ],
+        segments=segments,
         screenshot_paths=[screenshot_path] if screenshot_path else [],
         dedup_key=f"quota:x_post:{X_ACCOUNT}:{item['id']}",
     )
@@ -1112,7 +1149,13 @@ def _watch_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
     body = latest["text"].replace("\n", " ")
     if len(body) > 160:
         body = body[:160] + "…"
-    return [{"kind": "text", "text": f"{head}　<font color='grey'>{body}</font>"}]
+    segs = [{"kind": "text", "text": f"{head}　{body}"}]
+    zh_body = (latest.get("text_zh") or "").replace("\n", " ")
+    if zh_body:
+        if len(zh_body) > 160:
+            zh_body = zh_body[:160] + "…"
+        segs.append({"kind": "text", "text": f"<font color='grey'>翻译：{zh_body}</font>"})
+    return segs
 
 
 REPORT_META_KEY = "last_daily_report"
