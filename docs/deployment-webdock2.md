@@ -202,3 +202,16 @@ services:
 
 ### 案例 3：容器刚重启首轮采集的 SPA 渲染延迟
 - **实测观察**：容器冷启动后首轮采集可能因 Chrome 9225 尚未完成首屏 JS 水合（DOM innerText 暂时为空）返回单次 `partial`。进入正常轮询（或等待 5 秒 settle）后自动转为 `healthy`（置信度 100%）。无需手动清库或反复重启，让定时轮询自然衔接即可。
+
+### 案例 4：2026-10 页面轻量休眠、内存暴降 60% 与孤儿标签页治理
+- **背景与诉求**：双 Chrome 实例（9224 主账号 3 个标签页 + 9225 辅账号 1 个标签页）长期挂载 React 重型单页应用（ChatGPT / Claude / X），导致渲染进程虚拟 DOM 与 JS 堆内存持续累积，容器内存占用高达 2.22 GiB (19%)。用户希望降低常驻内存。
+- **技术选型权衡**：
+  - *为何不采用按需杀死 Chrome 进程？* 每次冷启动访问受强反爬保护的 ChatGPT / Claude 时，极易触发 Cloudflare Turnstile 人机验证质询盾导致自动化采集失败；且冷启动会导致 noVNC 人工登录与观察机制断层。
+  - *方案 A（轻量休眠）*：浏览器进程保持在线，采集完成后标签页切至 `about:blank#quota-target=<id>` 并触发 CDP V8/Native 垃圾回收（`HeapProfiler.collectGarbage` + `Memory.forciblyPurgeJavaScriptMemory`）。轮询触发时自动唤醒回额度页；发生认证异常（`auth_required` / `blocked`）时强制跳过休眠，保持原登录界面供人工排查。
+- **踩坑与实战演进**：
+  1. *Chrome 崩溃恢复气泡（Restore pages?）*：非正常停止容器导致 Chrome 记录异常退出标记。启动时若触发 Session Restore 会自动恢复旧页面导致标签页倍增。解法：在 `docker/quota-entrypoint.sh` 启动前用 Python 重置 `Preferences` 里的 `exit_type: "Normal"`，并注入启动参数 `--hide-crash-restore-bubble`。
+  2. *孤儿标签页（多余页面）清扫*：旧逻辑仅清理同一 target 的同源重复页，无法清理崩溃恢复产生的未认领页面。解法：在 `quota_monitor/app.py` 中记录 `claimed_pages`，每轮循环结束后将所有未被合法 target 认领的多余页面执行 `page.close()`，严格保证 9224 端口精确 3 个标签页、9225 端口精确 1 个标签页。
+- **实测指标（2026-10-10 实测）**：
+  - 容器内存由 **2.22 GiB (19%)** 暴跌至 **901 MiB ~ 1.28 GiB**（内存净降幅达 40%~60%，节约超过 1GB 物理内存）；
+  - 空闲 CPU 占用由原本的 13% 降至 **0.26% ~ 0.28%**；
+  - 活跃 PIDS 由 412 降至 306~347。
