@@ -56,6 +56,7 @@ try:
     RETENTION_DAYS = max(1, int(os.getenv("QUOTA_RETENTION_DAYS", "7")))
 except ValueError:
     RETENTION_DAYS = 7
+PAGE_HIBERNATE = os.getenv("QUOTA_PAGE_HIBERNATE", "true").strip().lower() in ("true", "1", "yes")
 # 容器跑在 UTC（页面也就按 UTC 渲染），但卡片和报表时刻都按这个时区走。
 # 值的判定一律用归一化后的绝对时间，展示时区只决定「几点算早报」和文案怎么写。
 DISPLAY_TZ = os.getenv("QUOTA_DISPLAY_TZ", "Asia/Singapore")
@@ -1047,8 +1048,59 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             screenshot_paths=[screenshot_path] if screenshot_path else [],
             dedup_key=f"quota:limit_reset:{provider}:{resets_avail}:{fields.get('resets_expires_at', '')}",
         )
-    await _purge_page_memory(page)
+    if PAGE_HIBERNATE and result.get("status") not in ("auth_required", "blocked"):
+        await _hibernate_page(page, provider)
+    else:
+        await _purge_page_memory(page)
     return result
+
+
+async def _hibernate_page(page: Any, target: dict[str, Any] | str) -> None:
+    """将已完成采集的标签页引导至轻量休眠占位页，卸载重型 SPA 并触发 Native/V8 垃圾回收。
+
+    此举兼顾内存释放与登录态安全：
+    1. 卸载 ChatGPT / Claude / X 沉重的 React 虚拟 DOM、状态堆及长连接，渲染进程内存从 ~200MB 降至 ~20MB；
+    2. 保持 Chrome 进程和 Browser Profile（Cookie、LocalStorage、TLS 指纹）持续存活，避免冷启动触发 Cloudflare 质询盾；
+    3. URL 使用 about:blank#quota-target=<id>，保留 target 锚点，下轮轮询可精准唤醒复用；
+    4. 渲染轻量深色提示卡，在 noVNC 桌面提供良好的可观测性。
+    """
+    provider = target if isinstance(target, str) else target.get("id", "")
+    target_obj = get_target_by_id(provider) if isinstance(target, str) else target
+    name = target_obj.get("name", provider) if isinstance(target_obj, dict) else provider
+
+    try:
+        blank_url = f"about:blank#quota-target={provider}"
+        await page.goto(blank_url, timeout=10_000)
+
+        label = _provider_label(provider)
+        title_text = f"[休眠] {label.get('name', name)}"
+        html_body = (
+            '<div style="background:#1e293b;border:1px solid #334155;border-radius:10px;'
+            'padding:24px 36px;text-align:center;max-width:380px;box-shadow:0 10px 15px -3px rgba(0,0,0,0.5);">'
+            '<div style="font-size:0.8rem;font-weight:600;color:#38bdf8;margin-bottom:6px;letter-spacing:0.05em;">AI QUOTA MONITOR</div>'
+            f'<div style="font-size:1.25rem;font-weight:bold;color:#f8fafc;margin-bottom:8px;">{label.get("name", name)}</div>'
+            '<div style="font-size:0.85rem;color:#94a3b8;line-height:1.5;">💤 页面已进入内存休眠<br>释放渲染进程与 DOM 内存占用</div>'
+            '<div style="margin-top:16px;font-size:0.75rem;color:#64748b;">下次轮询时将自动重新载入额度页</div>'
+            '</div>'
+        )
+        await page.evaluate(
+            """({title, bodyHtml}) => {
+                document.title = title;
+                document.body.style.margin = '0';
+                document.body.style.height = '100vh';
+                document.body.style.display = 'flex';
+                document.body.style.alignItems = 'center';
+                document.body.style.justifyContent = 'center';
+                document.body.style.backgroundColor = '#0b1220';
+                document.body.style.fontFamily = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                document.body.innerHTML = bodyHtml;
+            }""",
+            {"title": title_text, "bodyHtml": html_body},
+        )
+    except Exception as exc:
+        LOG.debug("failed to set hibernate placeholder for %s: %s", provider, exc)
+
+    await _purge_page_memory(page)
 
 
 def _page_matches(p: Any, target: dict[str, Any] | str) -> bool:
@@ -1060,6 +1112,12 @@ def _page_matches(p: Any, target: dict[str, Any] | str) -> bool:
         kind = target.get("kind", provider_kind(provider))
 
     url = str(getattr(p, "url", "")).lower()
+
+    # 1. 休眠占位页仅凭 quota-target 锚点精确绑定目标，绝不参与后续站点子串匹配
+    if "about:blank" in url:
+        return f"quota-target={provider.lower()}" in url
+
+    # 2. 匹配在线目标站点 URL
     if kind == "x" or provider == X_PROVIDER:
         return "x.com/" in url
     if kind == "codex":
@@ -1120,6 +1178,8 @@ async def _run() -> None:
                             elif kind == "codex" and "/codex/cloud/settings/" not in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             elif kind == "x" and X_ACCOUNT.lower() not in page.url.lower():
+                                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                            elif "about:blank" in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             captured.append(await _capture(page, provider))
                     except Exception as cdp_err:

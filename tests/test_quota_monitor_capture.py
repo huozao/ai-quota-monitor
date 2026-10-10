@@ -340,6 +340,22 @@ def test_page_matches_and_find_page():
     assert quota_app._find_page(pages, {"id": "claude", "kind": "claude"}) is p_claude
     assert quota_app._find_page(pages, {"id": "x-thsottiaux", "kind": "x"}) is p_x
 
+    # Hibernated pages match by target id anchor in about:blank
+    p_hib_codex = DummyPage("about:blank#quota-target=codex")
+    p_hib_codex_2 = DummyPage("about:blank#quota-target=codex_2")
+    p_hib_claude = DummyPage("about:blank#quota-target=claude")
+
+    assert quota_app._page_matches(p_hib_codex, {"id": "codex", "kind": "codex"}) is True
+    assert quota_app._page_matches(p_hib_codex, {"id": "codex_2", "kind": "codex"}) is False
+    assert quota_app._page_matches(p_hib_codex_2, {"id": "codex_2", "kind": "codex"}) is True
+    assert quota_app._page_matches(p_hib_claude, {"id": "claude", "kind": "claude"}) is True
+    assert quota_app._page_matches(p_hib_claude, {"id": "codex", "kind": "codex"}) is False
+
+    hib_pages = [p_hib_claude, p_hib_codex, p_hib_codex_2]
+    assert quota_app._find_page(hib_pages, {"id": "codex", "kind": "codex"}) is p_hib_codex
+    assert quota_app._find_page(hib_pages, {"id": "codex_2", "kind": "codex"}) is p_hib_codex_2
+    assert quota_app._find_page(hib_pages, {"id": "claude", "kind": "claude"}) is p_hib_claude
+
 
 def test_build_quota_card_and_history_card_model(data_dir):
     # 构建测试用的额度 item

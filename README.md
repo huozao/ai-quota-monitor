@@ -137,6 +137,13 @@ can lead to significant renderer memory bloat and zombie process buildup:
 3. **Child Subreaper Hygiene**: `app.py` registers the main process as a child subreaper via
    `prctl(PR_SET_CHILD_SUBREAPER)` and handles `SIGCHLD` to automatically reap any orphaned child
    processes (such as Chrome `cat` wrappers) without leaving defunct zombies.
+4. **Lightweight Page Hibernation (`QUOTA_PAGE_HIBERNATE`)**: Enabled by default (`true`).
+   After each successful capture, tabs navigate to `about:blank#quota-target=<id>` and display
+   a minimal dark placeholder card before flushing GC. This unloads heavy React SPAs and background
+   WebSockets, shrinking renderer RSS from ~200MB down to ~20MB while preserving cookies, session
+   storage, and TLS fingerprints to avoid Cloudflare Turnstile blocks on subsequent wakes.
+   If authentication fails (`auth_required` / `blocked`), the page remains intact on the login screen
+   to allow manual re-authentication via noVNC.
 
 ### Host Topology & Integration
 

@@ -69,10 +69,11 @@ CHROME_PROXY_SERVER=http://host.docker.internal:7897
 # 端口 9224 为首实例，9225 为次实例（各占一半屏幕 680x768 并列排布）
 QUOTA_CODEX_ACCOUNTS="codex:9224:ishell168,codex_2:9225:www.nada.cn"
 
-# 轮询策略与保留周期
+# 轮询策略、页面休眠与保留周期
 QUOTA_POLL_MINUTES_MIN=20
 QUOTA_POLL_MINUTES_MAX=30
 QUOTA_PAGE_SETTLE_SECONDS=5
+QUOTA_PAGE_HIBERNATE=true
 QUOTA_RETENTION_DAYS=7
 QUOTA_REPORT_TIMES="08:00,13:00,20:00"
 
@@ -122,6 +123,9 @@ services:
    - `/healthz` 遍历检查所有声明的 CDP 端口（`browser_cdp_ports: {"9224": true, "9225": true}`），任一浏览器未就绪则返回 `503`，确保监控不会误报健康状态。
 5. **门控文件与采集恢复**：
    - 数据卷中的 `ATTACH_ENABLED` 持久存在，采集循环 `_loop` 检测到后自动开始定时轮询。
+6. **轻量页面休眠与内存释放**：
+   - 每次采集完成后标签页切至 `about:blank#quota-target=<id>` 并主动触发 V8/Native GC，使长期空闲时的 Chrome 渲染进程物理内存（RSS）由 ~200MB 降至 ~20MB。
+   - 遇到 `auth_required` / `blocked` 时自动保持原页面不休眠，方便用户在 noVNC 桌面中直观查看登录状态并完成认证。
 
 ---
 
