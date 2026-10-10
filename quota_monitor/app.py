@@ -1154,6 +1154,7 @@ async def _run() -> None:
                             LOG.warning("CDP endpoint %s has no browser context", cdp_url)
                             continue
                         pages = list(context.pages)
+                        claimed_pages: list[Any] = []
                         for target in acc_list:
                             provider = target["id"]
                             kind = target["kind"]
@@ -1173,6 +1174,7 @@ async def _run() -> None:
                                             pages.remove(dup)
                                     except Exception:
                                         pass
+                            claimed_pages.append(page)
                             if kind == "claude" and "#settings/usage" not in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             elif kind == "codex" and "/codex/cloud/settings/" not in page.url:
@@ -1182,6 +1184,18 @@ async def _run() -> None:
                             elif "about:blank" in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             captured.append(await _capture(page, provider))
+
+                        # 自动清理孤儿/未认领标签页：保证每个浏览器实例仅保留活跃目标独占标签页
+                        for extra_page in list(context.pages):
+                            if extra_page not in claimed_pages:
+                                try:
+                                    extra_url = str(getattr(extra_page, "url", ""))
+                                    LOG.info("cleaning up orphan/duplicate page on %s: %s", cdp_url, extra_url)
+                                    await extra_page.close()
+                                    if extra_page in pages:
+                                        pages.remove(extra_page)
+                                except Exception as close_err:
+                                    LOG.debug("failed to close orphan page: %s", close_err)
                     except Exception as cdp_err:
                         LOG.warning("cycle for cdp endpoint %s failed: %s: %s", cdp_url, type(cdp_err).__name__, cdp_err)
                 if captured:

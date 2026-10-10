@@ -67,12 +67,26 @@ for inst in instances:
 ' | while IFS=$'\t' read -r port profile_dir pos size urls; do
   mkdir -p "$profile_dir"
   rm -f "${profile_dir}/SingletonLock" "${profile_dir}/SingletonSocket" "${profile_dir}/SingletonCookie"
+  python3 -c "
+import glob, json
+for path in glob.glob('${profile_dir}/Default/Preferences') + glob.glob('${profile_dir}/Preferences'):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if 'profile' in d and isinstance(d['profile'], dict):
+            d['profile']['exit_type'] = 'Normal'
+            d['profile']['exited_cleanly'] = True
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+" 2>/dev/null || true
   chrome_args=(
     /usr/bin/webdock-chrome
     "--user-data-dir=${profile_dir}"
     --remote-debugging-address=127.0.0.1
     "--remote-debugging-port=${port}" --no-first-run --no-default-browser-check \
-    --disable-session-crashed-bubble --disable-breakpad --disable-crash-reporter \
+    --disable-session-crashed-bubble --hide-crash-restore-bubble --disable-breakpad --disable-crash-reporter \
     --disable-dev-shm-usage --no-sandbox \
     "--window-position=${pos}" \
     "--window-size=${size}" \

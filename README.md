@@ -113,6 +113,10 @@ multiple matching tabs for a provider, the collector automatically reuses the
 first matching page and closes all redundant duplicates (`await dup.close()`).
 This was verified on webdock2 on 2026-09-24: multiple duplicate tabs on port 9225
 were automatically cleaned up to a single active page without disrupting the user session.
+Furthermore, any unclaimed orphan pages (e.g. tabs recreated by crash restore or user interactions)
+are automatically closed after each cycle, ensuring an exact 1:1 mapping between targets and tabs.
+Startup scripts also sanitize `exit_type` in `Preferences` and supply `--hide-crash-restore-bubble`
+to suppress crash restore prompts.
 
 ### Notification constraints
 
