@@ -217,3 +217,23 @@ services:
   - 容器内存由 **2.22 GiB (19%)** 暴跌至 **901 MiB ~ 1.28 GiB**（内存净降幅达 40%~60%，节约超过 1GB 物理内存）；
   - 空闲 CPU 占用由原本的 13% 降至 **0.26% ~ 0.28%**；
   - 活跃 PIDS 由 412 降至 306~347。
+
+### 案例 5：2026-10 部署配置漂移事故与 SSOT（SOPS）权威闭环
+- **事故现象**：宿主机更新 webdock 容器后，ai-quota-monitor 突发推文翻译丢失、周趋势图 404、辅账号 codex_2 停采、主账号额度百分比缺失（返回 None）。
+- **根因分析**：
+  - 宿主机 `/opt/webdock/deploy/laptop/.env` 并非权威正本，而是由 `infra` 仓库 `render.sh webdock2` 从 `secrets/webdock2.enc.env` 解密单向生成。
+  - 此前 quota-monitor 新增的多账号（`QUOTA_CODEX_ACCOUNTS`）及休眠配置直接在宿主机 `.env` 热修生效，未回写 `infra` 的 SOPS 加密文件；且镜像 pin 仍停留在 9 月旧版。
+  - webdock 正常部署执行 `render.sh` 时，完全忠实地按照 `infra` 主线重新生成 `.env`，导致宿主机手写配置被冲掉、镜像被强行降级回 9 月旧版。
+- **解法与铁律**：
+  1. 严格贯彻 **Git 为唯一权威源（SSOT）**：所有宿主机环境配置必须通过 `sops set` 写入 `infra/secrets/webdock2.enc.env` 并合入 `main`，严禁在宿主机脱离 Git 长期维护手写配置。
+  2. 部署时通过 `render.sh` 统一安全下发，确保任意服务重建都不会造成配置回退。
+
+### 案例 6：Cloudflare 验证盾识别（blocked）、休眠门禁白名单收紧与人机认证协同
+- **设计缺陷与现象**：
+  - Claude 触发 Cloudflare Turnstile 人机验证盾（`Performing security verification`）时，原正则仅识别 `log in` / `sign in` 为 `auth_required`，缺少拦截关键词匹配，导致将其错误判定为 `schema_changed`。
+  - 原休眠门禁采用黑名单豁免（`not in ("auth_required", "blocked")`），漏过了 `schema_changed`，导致页面在截图后立马切至 `about:blank#quota-target=claude` 休眠卡片，掩盖了真实质询盾现场。
+  - 用户在 noVNC 打开后台浏览器时只见休眠卡片，不见验证盾，无法手动点击；下轮轮询唤醒时再次撞盾，陷入死循环。
+- **解法**：
+  1. `_parse` 与 `_parse_posts` 增加 Cloudflare / Turnstile 质询文案匹配，准确返回 `status = "blocked"`。
+  2. 休眠门禁全面收紧为**白名单模式**：`if PAGE_HIBERNATE and result.get("status") in ("healthy", "partial")`。凡是 `blocked`、`auth_required`、`schema_changed` 等异常状态，**一律禁止休眠，强行保留页面现场留在屏幕上**，确保人工随时在 noVNC 看到并操作。
+  3. **人机认证与探测机制**：额度监控器为 20~30 分钟一次的离散轮询（抓完即断开 CDP），在休眠间歇期浏览器为绝对静止纯净状态，人工可随时在 noVNC 点击通过质询；若需长时间复杂认证，可通过删除 `ATTACH_ENABLED` 门控文件彻底暂停轮询探测。
