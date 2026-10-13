@@ -212,7 +212,12 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
         "unusual traffic",
     )):
         return {}, 0.0, "blocked"
-    if any(x in lowered for x in ("log in", "sign in", "登录", "登录后")):
+    # 登录态检测需避免将已处于设置/额度页面内部的历史会话标题（如「登录失败排查」）误判为未登录
+    is_usage_view = any(x in lowered for x in ("your usage", "plan limits", "usage limits", "log out", "sign out"))
+    if not is_usage_view and any(x in lowered for x in (
+        "log in to ", "sign in to ", "log in with ", "sign in with ", "please log in", "please sign in",
+        "sign up or log in", "enter your email", "welcome back", "请登录", "请先登录", "登录以继续", "立即登录",
+    )):
         return {}, 0.0, "auth_required"
     if any(x in lowered for x in ("loading usage data", "loading usage...", "loading data")):
         return {}, 0.0, "loading"
@@ -297,22 +302,65 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
             return fields, 0.3, status
         return fields, min(1.0, 0.6 + 0.1 * len(fields)) if fields else 0.0, "healthy" if fields else "schema_changed"
     fields: dict[str, Any] = {}
-    patterns = {
-        "used": r"(?:used|已用)\s*[:：]?\s*([\d,.]+\s*%?)",
-        "remaining": r"(?:remaining|left|剩余)\s*[:：]?\s*([\d,.]+\s*%?)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, text, flags=re.I)
-        if match:
-            fields[key] = match.group(1).strip()
-    # 重置时间只按小节边界取：全页第一条 Resets 在会话未开始时属于周额度块，
-    # 第二条属于与额度窗口无关的 Usage credits。
+    used_pat = r"(?:(?:used|已用)\s*[:：]?\s*([\d,.]+\s*%?)|([\d,.]+\s*%?)\s*(?:used|已用))"
+    remaining_pat = r"(?:(?:remaining|left|剩余)\s*[:：]?\s*([\d,.]+\s*%?)|([\d,.]+\s*%?)\s*(?:remaining|left|剩余))"
+
+    # 重置时间与小节分段：全页第一条 Resets 在会话未开始时属于周额度块，第二条属于 credits
     sections = claude_reset_sections(text)
-    if sections["session_reset"]:
+    session_block = sections.get("blocks", {}).get("session", "")
+    weekly_block = sections.get("blocks", {}).get("weekly", "")
+
+    # 1. 会话额度（5-hour window）：优先从小节块解析，无小节时全页回退
+    session_target = session_block if session_block else text
+    session_used_m = re.search(used_pat, session_target, flags=re.I)
+    session_rem_m = re.search(remaining_pat, session_target, flags=re.I)
+    if session_used_m:
+        used_str = (session_used_m.group(1) or session_used_m.group(2)).strip()
+        fields["used"] = used_str
+        try:
+            val = float(used_str.rstrip("%"))
+            fields["remaining"] = f"{100.0 - val:g}%"
+        except ValueError:
+            pass
+        fields["unit"] = "%"
+        fields["window"] = "5-hour session"
+    elif session_rem_m:
+        rem_str = (session_rem_m.group(1) or session_rem_m.group(2)).strip()
+        fields["remaining"] = rem_str
+        try:
+            val = float(rem_str.rstrip("%"))
+            fields["used"] = f"{100.0 - val:g}%"
+        except ValueError:
+            pass
+        fields["unit"] = "%"
+        fields["window"] = "5-hour session"
+
+    # 2. 周额度（Weekly limit）：从小节块解析周使用百分比与剩余百分比
+    if weekly_block:
+        weekly_used_m = re.search(used_pat, weekly_block, flags=re.I)
+        weekly_rem_m = re.search(remaining_pat, weekly_block, flags=re.I)
+        if weekly_used_m:
+            w_used_str = (weekly_used_m.group(1) or weekly_used_m.group(2)).strip()
+            fields["weekly_used_percent"] = w_used_str
+            try:
+                val = float(w_used_str.rstrip("%"))
+                fields["weekly_remaining"] = f"{100.0 - val:g}%"
+            except ValueError:
+                pass
+        elif weekly_rem_m:
+            w_rem_str = (weekly_rem_m.group(1) or weekly_rem_m.group(2)).strip()
+            fields["weekly_remaining"] = w_rem_str
+            try:
+                val = float(w_rem_str.rstrip("%"))
+                fields["weekly_used_percent"] = f"{100.0 - val:g}%"
+            except ValueError:
+                pass
+
+    if sections.get("session_reset"):
         fields["reset_at"] = sections["session_reset"]
-    if sections["weekly_reset"]:
+    if sections.get("weekly_reset"):
         fields["weekly_reset_at"] = sections["weekly_reset"]
-    if sections["session_idle"]:
+    if sections.get("session_idle"):
         fields["session_state"] = "idle"
     confidence = min(1.0, 0.35 + 0.25 * len(fields))
     status = "healthy" if fields else "schema_changed"
@@ -905,7 +953,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             fields, confidence, status = await _parse_posts(page, text)
         else:
             fields, confidence, status = _parse(provider, text)
-        if provider_kind(provider) == "claude" and status not in ("blocked", "auth_required"):
+        if provider_kind(provider) == "claude" and status != "blocked":
             meters = await page.locator("[role=meter][aria-valuenow][aria-valuemax='100']").evaluate_all(
                 "els => els.map(e => ({value:e.getAttribute('aria-valuenow'), text:e.getAttribute('aria-valuetext') || ''}))"
             )

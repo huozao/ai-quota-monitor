@@ -28,6 +28,13 @@ to standalone clones; a private parent workspace is not required for local work.
 - Do not commit, push, merge, create PRs, publish images, deploy, or modify remote
   resources without explicit authorization. Preserve unrelated worktree changes.
 
+## Core delivery principle & deployment SSOT
+
+- **GitHub as the sole source of truth (SSOT)**:
+  Any modification, parser enhancement, or bugfix must be locally verified via the test suite (`pytest`, `compileall`, `git diff --check`), then committed and pushed to GitHub. Runtime logic must always be executed directly from verified GitHub source code. Live hot-patching or manual file modifications on deployment hosts are strictly prohibited.
+- **Containerized deployment (GitOps)**:
+  Production environments must strictly run immutable container images built from GitHub source (e.g. `ghcr.io/huozao/ai-quota-monitor:sha-<commit>`). Configuration changes and image version pins are managed exclusively via GitOps (e.g. SOPS-encrypted environments in `infra` repo deployed via `render.sh`), ensuring zero host drift and reliable disaster recovery.
+
 ## Local verification
 
 Use a Python environment with `requirements.txt` and `pytest` installed:

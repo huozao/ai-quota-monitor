@@ -100,10 +100,13 @@ def limit_reset_candidate(current: dict[str, Any], previous: dict[str, Any] | No
 # 「Resets in 5 min」「Resets at 3:59 AM」「will reset after 2:24 AM.」三种前缀都出现过，
 # 引导词不属于时间本身，跟着进字段会让归一化认不出来。
 _RESET_LINE = re.compile(r"resets?\s+(?:in\s+|at\s+|after\s+)?([^\n]{1,80})", re.I)
-_SESSION_IDLE = "starts when a message is sent"
+_SESSION_IDLE_PATTERNS = ("starts when a message is sent", "starts with your first message")
 # 小节边界。最后一项只当边界用（credits 的重置与额度窗口无关，必须被切在外面）。
-# 小节边界。最后一项只当边界用（credits 的重置与额度窗口无关，必须被切在外面）。
-CLAUDE_SECTIONS = (("session", ("current session",)), ("weekly", ("weekly limits",)), ("", ("usage credits",)))
+CLAUDE_SECTIONS = (
+    ("session", ("current session",)),
+    ("weekly", ("weekly limits", "this week")),
+    ("", ("limit resets", "usage credits")),
+)
 CODEX_SECTIONS = (
     ("five_hour", ("5-hour limit", "5 hour limit", "5 hour usage limit", "5-hour usage limit")),
     ("weekly", ("weekly limit", "weekly usage limit")),
@@ -168,7 +171,8 @@ def claude_reset_sections(text: str) -> dict[str, Any]:
         "anchored": result["anchored"],
         "session_reset": result.get("session"),
         "weekly_reset": result.get("weekly"),
-        "session_idle": _SESSION_IDLE in session_block.lower(),
+        "session_idle": any(p in session_block.lower() for p in _SESSION_IDLE_PATTERNS),
+        "blocks": result.get("blocks", {}),
     }
 
 

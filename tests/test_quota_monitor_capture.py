@@ -671,3 +671,27 @@ def test_hibernation_guard_preserves_blocked_and_errored_pages(data_dir, monkeyp
     cap_healthy = asyncio.run(quota_app._capture(page_healthy, "codex"))
     assert cap_healthy["status"] == "healthy"
     assert "codex" in hibernated
+
+
+def test_chat_history_login_title_does_not_trigger_auth_required(data_dir):
+    text_with_chat_title = (
+        "Home\nCode\nNew\nProjects\nArtifacts\nSettings\n"
+        "Chats and tasks\n"
+        "终端CLI登录连接失败\n"
+        "Antigravity pronunciation guide\n"
+        "Your usage\nPro\nCurrent session\nStarts with your first message\n0% used\nThis week\nResets Saturday 10:00 AM\n12% used\n"
+    )
+    fields, conf, status = quota_app._parse("claude", text_with_chat_title)
+    assert status == "healthy"
+    assert fields.get("used") == "0%"
+    assert fields.get("remaining") == "100%"
+    assert fields.get("window") == "5-hour session"
+    assert fields.get("weekly_used_percent") == "12%"
+    assert fields.get("weekly_remaining") == "88%"
+    assert fields.get("weekly_reset_at") == "Saturday 10:00 AM"
+    assert fields.get("session_state") == "idle"
+
+    # 真实的未登录界面必须准确识别为 auth_required
+    real_login_text = "Welcome back\nPlease log in to continue\nEnter your email"
+    fields_login, _, status_login = quota_app._parse("claude", real_login_text)
+    assert status_login == "auth_required"

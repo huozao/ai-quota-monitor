@@ -237,3 +237,25 @@ services:
   1. `_parse` 与 `_parse_posts` 增加 Cloudflare / Turnstile 质询文案匹配，准确返回 `status = "blocked"`。
   2. 休眠门禁全面收紧为**白名单模式**：`if PAGE_HIBERNATE and result.get("status") in ("healthy", "partial")`。凡是 `blocked`、`auth_required`、`schema_changed` 等异常状态，**一律禁止休眠，强行保留页面现场留在屏幕上**，确保人工随时在 noVNC 看到并操作。
   3. **人机认证与探测机制**：额度监控器为 20~30 分钟一次的离散轮询（抓完即断开 CDP），在休眠间歇期浏览器为绝对静止纯净状态，人工可随时在 noVNC 点击通过质询；若需长时间复杂认证，可通过删除 `ATTACH_ENABLED` 门控文件彻底暂停轮询探测。
+
+### 案例 7：Claude 历史会话标题干扰登录态识别与 5h/周额度分段解析
+- **事故现象与边界条件**：
+  - 人工通过 Cloudflare 盾完成验证后，页面进入正常 Usage 界面且能看到额度，但随后的采集却被误判为「需重新登录」（`auth_required`），且 5 小时和周额度无法解析。
+  - **根因一（假未登录）**：Claude 侧边栏历史会话列表中含有如「终端CLI登录连接失败」等标题。原 `_parse` 逻辑无边界匹配 `"登录"`，命中会话标题中的文字，导致已登录且展示额度的页面直接返回空字段和 `auth_required`。
+  - **根因二（数值前置与小节未分段）**：Claude 现行 UI 渲染文本格式为 `0% used` / `12% used`（数值前置于 `used`），原正则仅支持后置；且文本中包含 `Current session` 与 `This week` 两处 `used`，原逻辑未按小节分别提取，导致周额度缺失；周限额标记缺少 `this week`，引导词 `Starts with your first message` 未适配导致无法识别 `idle`。
+- **解法**：
+  1. **登录态上下文门禁**：在判定未登录前，优先识别当前是否已处于额度或设置面板视图（`is_usage_view`：包含 `"your usage"`, `"plan limits"`, `"usage limits"`, `"log out"`, `"sign out"`）。若处于面板视图，会话标题中的词汇绝不触发 `auth_required`；真实的未登录页面改用严格引导短语（`"please log in to"`, `"sign up or log in"`, `"enter your email"`, `"请先登录"` 等）。
+  2. **小节边界结构化解析**：`CLAUDE_SECTIONS` 周小节标记候选增加 `"this week"`，右边界增加 `"limit resets"`；分别从 `session_block` 提取 5 小时 `used`（`0%`）与 `remaining`（`100%`），从 `weekly_block` 提取周 `weekly_used_percent`（`12%`）与 `weekly_remaining`（`88%`），重置时间准确锚定。
+  3. **数值前置与后置双向正则**：`used_pat` 与 `remaining_pat` 调整为兼顾 `0% used` 与 `used: 0%`，提取时统一取 `match.group(1) or match.group(2)`。
+  4. **会话空闲态识别**：`_SESSION_IDLE_PATTERNS` 增加 `"starts with your first message"`，准确识别 `session_state: "idle"`。
+  5. **DOM 进度条优先**：在 `_capture` 中若检测到 `[role=meter]` 进度条，进一步互补提取与校准。
+
+---
+
+## 6. 核心交付准则与部署闭环 (SSOT)
+
+- **GitHub 作为唯一权威源码 (SSOT)**：
+  任何逻辑修复、解析器演进或配置调整，在本地通过测试套件充分验证（`pytest`、`compileall`、`git diff --check`）后，**必须提交并推送到 GitHub 源码仓库，严格以 GitHub 源码为准执行**。严禁在生产宿主机上进行任何形式的手工热补丁或文件篡改。
+- **标准化容器化交付 (GitOps)**：
+  生产环境**最终必须以容器化镜像方式进行部署**。流程严格遵守：
+  `本地验证 -> Git Commit & Push -> GitHub Actions 自动构建镜像 (ghcr.io/huozao/ai-quota-monitor:sha-<commit>) -> infra 仓库 SOPS 配置更新镜像 Tag -> 宿主机 render.sh 单向安全下发重启`。杜绝任何配置漂移与部署回退。
