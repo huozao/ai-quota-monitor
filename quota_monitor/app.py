@@ -197,6 +197,21 @@ def _prune_expired(conn: sqlite3.Connection, *, now: datetime | None = None) -> 
 def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
     """保守解析：页面结构变化时保留原文和截图，不把未知内容当成零额度。"""
     lowered = text.lower()
+    if any(x in lowered for x in (
+        "security verification",
+        "verify you are not a bot",
+        "cloudflare",
+        "turnstile",
+        "just a moment",
+        "challenge-running",
+        "attention required",
+        "access denied",
+        "robot or human",
+        "human verification",
+        "verify that you are human",
+        "unusual traffic",
+    )):
+        return {}, 0.0, "blocked"
     if any(x in lowered for x in ("log in", "sign in", "登录", "登录后")):
         return {}, 0.0, "auth_required"
     if any(x in lowered for x in ("loading usage data", "loading usage...", "loading data")):
@@ -356,6 +371,11 @@ async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str
         LOG.warning("timeline did not render within %dms", X_POST_WAIT_MS)
     posts = await _read_posts(page)
     if not posts:
+        if any(x in lowered for x in (
+            "security verification", "verify you are not a bot", "cloudflare", "turnstile",
+            "just a moment", "challenge-running", "attention required", "access denied", "robot or human",
+        )):
+            return {}, 0.0, "blocked"
         if "sign in" in lowered or "log in" in lowered or "登录" in lowered:
             return {}, 0.0, "auth_required"
         return {}, 0.0, "schema_changed"
@@ -885,7 +905,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             fields, confidence, status = await _parse_posts(page, text)
         else:
             fields, confidence, status = _parse(provider, text)
-        if provider_kind(provider) == "claude":
+        if provider_kind(provider) == "claude" and status not in ("blocked", "auth_required"):
             meters = await page.locator("[role=meter][aria-valuenow][aria-valuemax='100']").evaluate_all(
                 "els => els.map(e => ({value:e.getAttribute('aria-valuenow'), text:e.getAttribute('aria-valuetext') || ''}))"
             )
@@ -1048,7 +1068,7 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             screenshot_paths=[screenshot_path] if screenshot_path else [],
             dedup_key=f"quota:limit_reset:{provider}:{resets_avail}:{fields.get('resets_expires_at', '')}",
         )
-    if PAGE_HIBERNATE and result.get("status") not in ("auth_required", "blocked"):
+    if PAGE_HIBERNATE and result.get("status") in ("healthy", "partial"):
         await _hibernate_page(page, provider)
     else:
         await _purge_page_memory(page)

@@ -27,6 +27,9 @@ class _Locator:
     async def inner_text(self, timeout: int = 0) -> str:
         return self._text
 
+    async def evaluate_all(self, script: str) -> list[dict[str, str]]:
+        return []
+
 
 class _Mouse:
     async def move(self, x: int, y: int) -> None:
@@ -615,3 +618,56 @@ def test_codex_new_schema_2026_10_capture_and_card(data_dir, monkeypatch):
     assert fields_sub["weekly_remaining"] == "21%"
     assert fields_sub["credits_remaining"] == "0"
     assert fields_sub["resets_available"] == 0
+
+
+def test_cloudflare_and_challenge_blocked_detection(data_dir):
+    cf_text = (
+        "claude.ai\n"
+        "Performing security verification\n\n"
+        "This website uses a security service to protect against malicious bots. "
+        "This page is displayed while the website verifies you are not a bot.\n\n"
+        "Ray ID: a49bcd201b82405d\n"
+        "Performance and Security by Cloudflare\nPrivacy"
+    )
+    fields, conf, status = quota_app._parse("claude", cf_text)
+    assert status == "blocked"
+    assert conf == 0.0
+    assert fields == {}
+
+    fields_codex, _, status_codex = quota_app._parse("codex", "Just a moment...\nVerify you are not a bot\nCloudflare")
+    assert status_codex == "blocked"
+
+
+def test_hibernation_guard_preserves_blocked_and_errored_pages(data_dir, monkeypatch):
+    hibernated = []
+
+    async def fake_hibernate(page: object, provider: object) -> None:
+        hibernated.append(provider)
+
+    monkeypatch.setattr(quota_app, "_hibernate_page", fake_hibernate)
+    monkeypatch.setattr(quota_app, "PAGE_HIBERNATE", True)
+
+    cf_text = (
+        "claude.ai\n"
+        "Performing security verification\n\n"
+        "This website uses a security service to protect against malicious bots.\n"
+        "Ray ID: a49bcd201b82405d\nCloudflare"
+    )
+
+    # 1. Blocked 页面（Cloudflare 质询盾）严禁休眠，必须保留现场供人工通过
+    page_blocked = FakePage(cf_text, screenshot_fails=0)
+    cap_blocked = asyncio.run(quota_app._capture(page_blocked, "claude"))
+    assert cap_blocked["status"] == "blocked"
+    assert "claude" not in hibernated
+
+    # 2. 未知异常或结构改变（schema_changed）严禁休眠
+    page_unknown = FakePage("something completely unknown and empty", screenshot_fails=0)
+    cap_unknown = asyncio.run(quota_app._capture(page_unknown, "claude"))
+    assert cap_unknown["status"] == "schema_changed"
+    assert "claude" not in hibernated
+
+    # 3. 正常采集成功（healthy）必须休眠以释放渲染内存
+    page_healthy = FakePage(CODEX_TEXT, screenshot_fails=0)
+    cap_healthy = asyncio.run(quota_app._capture(page_healthy, "codex"))
+    assert cap_healthy["status"] == "healthy"
+    assert "codex" in hibernated
