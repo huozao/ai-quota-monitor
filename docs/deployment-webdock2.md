@@ -250,6 +250,12 @@ services:
   4. **会话空闲态识别**：`_SESSION_IDLE_PATTERNS` 增加 `"starts with your first message"`，准确识别 `session_state: "idle"`。
   5. **DOM 进度条优先**：在 `_capture` 中若检测到 `[role=meter]` 进度条，进一步互补提取与校准。
 
+### 案例 8：2026-10 网页翻译再次消失（控制台页只在同步分支上部署过）
+- **现象（2026-10-25 发现）**：X 观察位帖子在飞书卡片里有中文翻译，网页控制台没有。`/v1/quota/latest` 的 `posts[].text_zh` 正常下发，问题不在本仓。
+- **根因**：网页是 infra 的 `roles/server/tencent/files/console-quota.html`，由 infra 的 tencent 角色 `apply.sh` 渲染到边缘主机。案例 2 的翻译渲染（infra `85143c9`）只推到了同步分支，从那里 apply 过，从未合入 infra main；2026-10-17 有人为别的改动从 main apply，页面被覆盖回旧版。本仓镜像 pin 走的是另外几次已合入 main 的提交，所以后端一直是新的。
+- **处理**：渲染代码已合入 infra main 并重新 apply（线上哈希与仓库一致，2026-10-25 实测）。infra 侧同时加了三道防线：apply/render 拒绝部署 `origin/main` 之外的提交；版本看板漂移检查对比线上 `console-quota.html` 与 main；工作区每日体检列出远端分支上未进 main 的部署改动。
+- **教训**：本仓「推到 GitHub」不等于网页生效——控制台页和镜像 pin 都在 infra，必须进 infra **main** 才算交付。改网页显示时同时核对线上文件，不能只看 API 字段。
+
 ---
 
 ## 6. 核心交付准则与部署闭环 (SSOT)
