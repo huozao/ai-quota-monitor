@@ -34,6 +34,12 @@ to standalone clones; a private parent workspace is not required for local work.
   Any modification, parser enhancement, or bugfix must be locally verified via the test suite (`pytest`, `compileall`, `git diff --check`), then committed and pushed to GitHub. Runtime logic must always be executed directly from verified GitHub source code. Live hot-patching or manual file modifications on deployment hosts are strictly prohibited.
 - **Containerized deployment (GitOps)**:
   Production environments must strictly run immutable container images built from GitHub source (e.g. `ghcr.io/huozao/ai-quota-monitor:sha-<commit>`). Configuration changes and image version pins are managed exclusively via GitOps (e.g. SOPS-encrypted environments in `infra` repo deployed via `render.sh`), ensuring zero host drift and reliable disaster recovery.
+- **The web console is not in this repo**: the dashboard page (`console-quota.html`)
+  and the image pin both live in the operator's `infra` repo. A change that is visible
+  in the web page is delivered only when it is merged into infra **main**. Changes that
+  sit on a branch get reverted by the next apply from main. When the web page and Feishu
+  disagree, compare the live page with infra main before suspecting this API.
+  See Case 8 in [docs/deployment-webdock2.md](docs/deployment-webdock2.md).
 
 ## Local verification
 
