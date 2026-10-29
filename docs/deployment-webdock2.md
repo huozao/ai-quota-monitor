@@ -256,6 +256,19 @@ services:
 - **处理**：渲染代码已合入 infra main 并重新 apply（线上哈希与仓库一致，2026-10-25 实测）。infra 侧同时加了三道防线：apply/render 拒绝部署 `origin/main` 之外的提交；版本看板漂移检查对比线上 `console-quota.html` 与 main；工作区每日体检列出远端分支上未进 main 的部署改动。
 - **教训**：本仓「推到 GitHub」不等于网页生效——控制台页和镜像 pin 都在 infra，必须进 infra **main** 才算交付。改网页显示时同时核对线上文件，不能只看 API 字段。
 
+### 案例 9：2026-10 Claude 验证盾死锁、Playwright 驱动崩溃与 SIGCHLD 劫持致轮询停摆
+- **事故现象（2026-10-29 发现）**：监控从 10-28 18:02 后停止采集，控制台无新数据。Uvicorn 依然存活且 `/healthz` 返回 200，但后台采集主协程彻底死锁。
+- **根因分析**：
+  1. *诱因*：Claude 触发 Cloudflare Turnstile 验证盾，受 `--renderer-process-limit=2` 资源挤压，其渲染进程陷入 `futex_do_wait` 死锁，CDP 通讯失去响应。
+  2. *驱动崩溃*：Playwright `connect_over_cdp` 超时 180s 强行断开，底层 Node.js 驱动因未捕获 `Network.setCacheDisabled` 会话关闭异常而触发 `triggerUncaughtException` 退出。
+  3. *致命死锁*：`app.py` 中 `_setup_subreaper` 粗暴安装了全局 `signal.signal(signal.SIGCHLD, ...)`，导致 Node.js 退出状态被提前 `waitpid` 收割，绕过了 Python `asyncio` 的 Child Watcher。Playwright 上下文退出时执行 `await proc.communicate()`，陷入对已被收割进程的永久死锁。
+  4. *自愈盲区*：旧版 `/healthz` 仅探测端口 TCP，后台协程已死仍误报 200，容器未被 Docker 重启。
+- **解法**：
+  1. 去除 `_setup_subreaper` 中的全局 `SIGCHLD` 信号劫持，改在循环间隙通过 `reap_zombies()` 安全清理僵尸进程，恢复 `asyncio` 内部子进程生命周期管理。
+  2. 移除 entrypoint 中的 `--renderer-process-limit=2`，保持标准 site 隔离，防止多域名单进程锁死。
+  3. 强化 `/healthz`：主动校验后台 `_task` 存活状态及心跳周期（超过 `POLL_MAX + 10m` 未推进判定 stalled），异常时返回 503 触发 Docker 自动拉起自愈。
+  4. 为 `connect_over_cdp` 显式设置 30s 超时，杜绝 180s 长时间 hang 阻断循环。
+
 ---
 
 ## 6. 核心交付准则与部署闭环 (SSOT)

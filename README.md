@@ -131,16 +131,21 @@ Automated scraping of complex single-page applications (SPAs) over prolonged per
 can lead to significant renderer memory bloat and zombie process buildup:
 
 1. **Chrome Resource Constraints**: Browser instances are launched with `--mute-audio`,
-   `--disable-audio-output`, `--js-flags=--max-old-space-size=512`,
-   `--disable-features=OmniboxPopupAimWebUI,OptimizationHints,MediaRouter,Translate`, and
-   `--renderer-process-limit=2`. This disables unneeded background services (e.g. audio mojom,
-   internal omnibox WebUIs) and sets a firm V8 heap ceiling.
+   `--disable-audio-output`, `--js-flags=--max-old-space-size=512`, and
+   `--disable-features=OmniboxPopupAimWebUI,OptimizationHints,MediaRouter,Translate`.
+   This disables unneeded background services (e.g. audio mojom, internal omnibox WebUIs)
+   and sets a firm V8 heap ceiling while preserving standard site-per-process isolation.
 2. **Active Post-Capture Memory Purge**: After each collection cycle, `_purge_page_memory` sends
    `HeapProfiler.collectGarbage` and `Memory.forciblyPurgeJavaScriptMemory` via CDP to flush
    fragmented heap memory and unused layout resources from long-lived SPA tabs.
 3. **Child Subreaper Hygiene**: `app.py` registers the main process as a child subreaper via
-   `prctl(PR_SET_CHILD_SUBREAPER)` and handles `SIGCHLD` to automatically reap any orphaned child
-   processes (such as Chrome `cat` wrappers) without leaving defunct zombies.
+   `prctl(PR_SET_CHILD_SUBREAPER)` and reaps orphaned child processes (such as Chrome `cat` wrappers)
+   between cycles via `reap_zombies()` without installing raw `SIGCHLD` handlers that would corrupt
+   Python asyncio child watchers.
+4. **Collector Task & Stall Healthz Detection**: `/healthz` verifies not only CDP socket availability,
+   but also background collection task (`_task`) vitality and heartbeat progress. If the collection loop
+   crashes or stalls beyond the maximum poll window, `/healthz` responds with HTTP 503 to trigger container
+   healthcheck self-healing.
 4. **Lightweight Page Hibernation (`QUOTA_PAGE_HIBERNATE`)**: Enabled by default (`true`).
    After each successful capture, tabs navigate to `about:blank#quota-target=<id>` and display
    a minimal dark placeholder card before flushing GC. This unloads heavy React SPAs and background

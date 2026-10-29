@@ -95,7 +95,6 @@ for path in glob.glob('${profile_dir}/Default/Preferences') + glob.glob('${profi
     --disable-audio-output \
     '--js-flags=--max-old-space-size=512' \
     '--disable-features=OmniboxPopupAimWebUI,OptimizationHints,MediaRouter,Translate' \
-    --renderer-process-limit=2 \
     --disable-background-networking \
     --disable-component-update \
     --disable-sync \

@@ -92,34 +92,35 @@ X_SCREENSHOT_MAX_HEIGHT_PX = 3000
 app = FastAPI(title="quota-monitor", version="0.1.0")
 _task: asyncio.Task[None] | None = None
 _stop = asyncio.Event()
+_last_cycle_progress: float = 0.0
 
 
 def _setup_subreaper() -> None:
-    """在 Linux 下将当前进程设为子进程收割者（subreaper），并处理 SIGCHLD。
+    """在 Linux 下将当前进程设为子进程收割者（subreaper）。
 
-    避免 Chrome 包装脚本等产生的孤儿进程变为无法被 reap 的 defunct 僵尸进程。
+    注意：绝不直接安装覆盖全局 SIGCHLD 信号处理器，否则会破坏 asyncio 内部子进程监视器
+    （Child Watcher）对 Playwright 等子进程的生命周期监听与退出状态回收。
+    孤儿僵尸进程由循环间隙调用的 reap_zombies() 安全收割。
     """
     try:
         import ctypes
-        import signal
 
         prctl = getattr(ctypes.CDLL(None), "prctl", None)
         if prctl is not None:
             # PR_SET_CHILD_SUBREAPER = 36
             prctl(36, 1, 0, 0, 0)
-
-        if hasattr(signal, "SIGCHLD"):
-            def _sigchld_reaper(signum: int, frame: Any) -> None:
-                while True:
-                    try:
-                        pid, _ = os.waitpid(-1, os.WNOHANG)
-                        if pid <= 0:
-                            break
-                    except ChildProcessError:
-                        break
-
-            signal.signal(signal.SIGCHLD, _sigchld_reaper)
     except Exception:
+        pass
+
+
+def reap_zombies() -> None:
+    """安全收割孤儿僵尸进程，不破坏 asyncio 的全局 SIGCHLD 监听器。"""
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid <= 0:
+                break
+    except (ChildProcessError, OSError):
         pass
 
 
@@ -1201,11 +1202,14 @@ def _find_page(pages: list[Any], target: dict[str, Any] | str) -> Any | None:
 
 
 async def _run() -> None:
+    global _last_cycle_progress
     # 关键安全边界：在 ATTACH_ENABLED 出现前，浏览器存在但 Playwright/CDP 不接管。
     while not _stop.is_set():
         if not ENABLE_FILE.exists():
             await asyncio.sleep(5)
             continue
+        _last_cycle_progress = time.time()
+        reap_zombies()
         try:
             targets = get_active_targets()
             captured: list[dict[str, Any]] = []
@@ -1216,7 +1220,7 @@ async def _run() -> None:
             async with async_playwright() as pw:
                 for cdp_url, acc_list in targets_by_cdp.items():
                     try:
-                        browser = await pw.chromium.connect_over_cdp(cdp_url)
+                        browser = await pw.chromium.connect_over_cdp(cdp_url, timeout=30_000)
                         context = browser.contexts[0] if browser.contexts else None
                         if context is None:
                             LOG.warning("CDP endpoint %s has no browser context", cdp_url)
@@ -1224,6 +1228,7 @@ async def _run() -> None:
                         pages = list(context.pages)
                         claimed_pages: list[Any] = []
                         for target in acc_list:
+                            _last_cycle_progress = time.time()
                             provider = target["id"]
                             kind = target["kind"]
                             url = target["url"]
@@ -1252,6 +1257,7 @@ async def _run() -> None:
                             elif "about:blank" in page.url:
                                 await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                             captured.append(await _capture(page, provider))
+                            _last_cycle_progress = time.time()
 
                         # 自动清理孤儿/未认领标签页：保证每个浏览器实例仅保留活跃目标独占标签页
                         for extra_page in list(context.pages):
@@ -1272,8 +1278,15 @@ async def _run() -> None:
                 # async with 退出时只结束 Playwright 连接，浏览器进程和手工登录态保持不动。
         except Exception as exc:
             LOG.warning("monitor cycle failed: %s: %s", type(exc).__name__, exc)
+        finally:
+            reap_zombies()
+            _last_cycle_progress = time.time()
+
         delay = random.uniform(POLL_MIN, POLL_MAX) * 60
-        await asyncio.sleep(delay)
+        end_time = time.time() + delay
+        while time.time() < end_time and not _stop.is_set():
+            await asyncio.sleep(min(5.0, max(0.5, end_time - time.time())))
+            _last_cycle_progress = time.time()
 
 
 def _watch_segments(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1409,14 +1422,41 @@ def healthz() -> dict[str, Any]:
             status = False
         port_statuses[str(p)] = status
 
-    all_ready = all(port_statuses.values()) if port_statuses else False
-    result = {
+    cdp_ready = all(port_statuses.values()) if port_statuses else False
+    task_alive = True
+    task_stalled = False
+    task_error: str | None = None
+
+    if ENABLE_FILE.exists() and _task is not None:
+        if _task.done():
+            task_alive = False
+            if not _task.cancelled():
+                try:
+                    exc = _task.exception()
+                    if exc is not None:
+                        task_error = f"{type(exc).__name__}: {exc}"
+                except Exception:
+                    pass
+        elif _last_cycle_progress > 0:
+            stall_threshold = (POLL_MAX * 60) + 600
+            if (time.time() - _last_cycle_progress) > stall_threshold:
+                task_stalled = True
+
+    all_ready = cdp_ready and task_alive and not task_stalled
+    result: dict[str, Any] = {
         "ok": all_ready,
         "attach_enabled": ENABLE_FILE.exists(),
-        "browser_cdp": all_ready,
+        "browser_cdp": cdp_ready,
         "browser_cdp_ports": port_statuses,
+        "task_alive": task_alive,
+        "task_stalled": task_stalled,
         "db": str(DB_PATH),
     }
+    if task_error:
+        result["task_error"] = task_error
+    if _last_cycle_progress > 0:
+        result["last_cycle_progress_ago_seconds"] = int(time.time() - _last_cycle_progress)
+
     if not all_ready:
         raise HTTPException(status_code=503, detail=result)
     return result

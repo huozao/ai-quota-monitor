@@ -511,6 +511,7 @@ def test_purge_page_memory_handles_missing_context() -> None:
 
 def test_setup_subreaper_safe() -> None:
     quota_app._setup_subreaper()
+    quota_app.reap_zombies()
 
 
 def test_codex_loading_state_prevents_false_limit_reset(data_dir, monkeypatch):
