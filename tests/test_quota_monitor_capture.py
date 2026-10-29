@@ -544,6 +544,35 @@ def test_codex_loading_state_prevents_false_limit_reset(data_dir, monkeypatch):
     assert len(notifications) == 0
 
 
+def test_capture_recovers_from_transient_loading(data_dir, monkeypatch):
+    texts = [
+        "Usage\nLoading usage settings…",
+        "Usage\nLoading usage settings…",
+        CODEX_WITH_LIMIT_RESETS,
+    ]
+    call_count = 0
+
+    class _ChangingLocator:
+        async def inner_text(self, timeout: int = 0) -> str:
+            nonlocal call_count
+            t = texts[min(call_count, len(texts) - 1)]
+            call_count += 1
+            return t
+
+        async def evaluate_all(self, script: str) -> list[dict[str, str]]:
+            return []
+
+    class _DynamicPage(FakePage):
+        def locator(self, selector: str) -> _ChangingLocator:
+            return _ChangingLocator()
+
+    page = _DynamicPage(texts[0], screenshot_fails=0)
+    res = asyncio.run(quota_app._capture(page, "codex"))
+    assert res["status"] == "healthy"
+    assert res["fields"]["resets_available"] == 1
+    assert call_count >= 3
+
+
 def test_codex_new_schema_2026_10_capture_and_card(data_dir, monkeypatch):
     notifications = []
 

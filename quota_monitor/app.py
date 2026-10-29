@@ -220,7 +220,10 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
         "sign up or log in", "enter your email", "welcome back", "请登录", "请先登录", "登录以继续", "立即登录",
     )):
         return {}, 0.0, "auth_required"
-    if any(x in lowered for x in ("loading usage data", "loading usage...", "loading data")):
+    if any(x in lowered for x in (
+        "loading usage data", "loading usage...", "loading data",
+        "loading usage settings", "loading settings",
+    )):
         return {}, 0.0, "loading"
     if provider_kind(provider) == "codex":
         fields: dict[str, Any] = {}
@@ -299,7 +302,7 @@ def _parse(provider: str, text: str) -> tuple[dict[str, Any], float, str]:
             if type_match:
                 fields["resets_type"] = type_match.group(1).strip()
         if not (five_hour or weekly):
-            status = "loading" if "loading" in lowered else "partial"
+            status = "loading" if any(x in lowered for x in ("loading", "loading settings", "loading usage")) else "partial"
             return fields, 0.3, status
         return fields, min(1.0, 0.6 + 0.1 * len(fields)) if fields else 0.0, "healthy" if fields else "schema_changed"
     fields: dict[str, Any] = {}
@@ -954,6 +957,38 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
             fields, confidence, status = await _parse_posts(page, text)
         else:
             fields, confidence, status = _parse(provider, text)
+
+        # SPA 异步数据加载与骨架屏轮询等待：
+        # 若页面显示正在加载（如 Codex 的 "Loading usage settings…"），以短间隔轮询等待渲染完成（最多等待 ~15 秒）；
+        # 若仍超时，触发一次单次页面 reload 补救重试（类似人工刷新），避免首屏卡死被直接落库为 loading。
+        if status == "loading" and provider_kind(provider) != "x":
+            for _ in range(10):
+                await page.wait_for_timeout(1500)
+                try:
+                    text = await page.locator("body").inner_text(timeout=15_000)
+                    fields, confidence, status = _parse(provider, text)
+                except Exception:
+                    continue
+                if status != "loading":
+                    break
+
+            if status == "loading":
+                LOG.info("provider %s still loading after settle wait, retrying single reload", provider)
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    await page.wait_for_timeout(int(PAGE_SETTLE_SECONDS * 1000))
+                    for _ in range(10):
+                        try:
+                            text = await page.locator("body").inner_text(timeout=15_000)
+                            fields, confidence, status = _parse(provider, text)
+                        except Exception:
+                            continue
+                        if status != "loading":
+                            break
+                        await page.wait_for_timeout(1500)
+                except Exception as reload_err:
+                    LOG.debug("reload retry for %s failed: %s", provider, reload_err)
+
         if provider_kind(provider) == "claude" and status != "blocked":
             meters = await page.locator("[role=meter][aria-valuenow][aria-valuemax='100']").evaluate_all(
                 "els => els.map(e => ({value:e.getAttribute('aria-valuenow'), text:e.getAttribute('aria-valuetext') || ''}))"

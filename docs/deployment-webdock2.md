@@ -202,8 +202,9 @@ services:
   - 网页控制台（`https://hydwang.xyz/console/quota/`）：主段落展示英文原文，下方附 `<p class="post-zh" style="color:var(--muted);font-size:.82rem;margin:2px 0 6px;line-height:1.45;">翻译：${text_zh}</p>`。
 - **翻译通道**：通过 `translate.googleapis.com` 请求（受 `CHROME_PROXY_SERVER` 路由代理保护），采用内存 LRU 缓存（256 条）避免重复调用与网络抖动。
 
-### 案例 3：容器刚重启首轮采集的 SPA 渲染延迟
-- **实测观察**：容器冷启动后首轮采集可能因 Chrome 9225 尚未完成首屏 JS 水合（DOM innerText 暂时为空）返回单次 `partial`。进入正常轮询（或等待 5 秒 settle）后自动转为 `healthy`（置信度 100%）。无需手动清库或反复重启，让定时轮询自然衔接即可。
+### 案例 3：容器刚重启首轮采集的 SPA 渲染延迟与骨架屏轮询优化
+- **实测观察**：容器冷启动后首轮采集可能因 Chrome 9225 尚未完成首屏 JS 水合（DOM innerText 暂时为空或显示 "Loading usage settings…"）返回单次 `partial` / `loading`。
+- **2026-10-29 演进**：在 `_capture` 中增加 SPA 异步数据加载与骨架屏轮询等待机制。若遇到 `loading` 状态，以 1.5s 间隔轮询等待最多 15s；若仍未就绪则自动触发单次 `page.reload` 补救重试（类似人工刷新机制），彻底避免首屏加载慢或 React 临时骨架屏被直接落库记录为 loading。无需人工进入 noVNC 手动刷新。
 
 ### 案例 4：2026-10 页面轻量休眠、内存暴降 60% 与孤儿标签页治理
 - **背景与诉求**：双 Chrome 实例（9224 主账号 3 个标签页 + 9225 辅账号 1 个标签页）长期挂载 React 重型单页应用（ChatGPT / Claude / X），导致渲染进程虚拟 DOM 与 JS 堆内存持续累积，容器内存占用高达 2.22 GiB (19%)。用户希望降低常驻内存。
