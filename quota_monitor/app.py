@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from patchright.async_api import async_playwright
 
 from .chart import generate_weekly_trend_chart
-from .translate import translate_text
+from .translate import get_cached, set_cached, translate_text
 from .core import (
     alertable_posts,
     claude_reset_sections,
@@ -410,7 +410,11 @@ async def _read_posts(page: Any) -> list[dict[str, Any]]:
     return posts
 
 
-async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str]:
+async def _parse_posts(
+    page: Any,
+    text: str,
+    known_translations: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], float, str]:
     """X 观察位的解析。拿不到帖子就是页面结构变了或登录态掉了，绝不当成「没有新消息」。"""
     lowered = text.lower()
     # ⚠️ 不能只靠 QUOTA_PAGE_SETTLE_SECONDS（默认 5 秒）就读。2026-09-08 生产实测 capture
@@ -433,10 +437,15 @@ async def _parse_posts(page: Any, text: str) -> tuple[dict[str, Any], float, str
         return {}, 0.0, "schema_changed"
     async def _attach_meta(item: dict[str, Any]) -> None:
         item["is_reset"] = is_reset_post(item["text"], X_KEYWORDS)
-        if item.get("text"):
-            item["text_zh"] = await translate_text(item["text"])
-        else:
+        txt = (item.get("text") or "").strip()
+        if not txt:
             item["text_zh"] = None
+            return
+        if known_translations and txt in known_translations and known_translations[txt]:
+            item["text_zh"] = known_translations[txt]
+            set_cached(txt, known_translations[txt])
+        else:
+            item["text_zh"] = await translate_text(txt)
 
     await asyncio.gather(*[_attach_meta(p) for p in posts])
     return {"account": X_ACCOUNT, "posts": posts}, 0.9, "healthy"
@@ -582,7 +591,15 @@ def build_quota_card(item: dict[str, Any]) -> dict[str, Any]:
     # X 观察位卡片模型
     if kind == "x" or provider == X_PROVIDER:
         account = fields.get("account") or X_ACCOUNT
-        posts = fields.get("posts") or []
+        raw_posts = fields.get("posts") or []
+        posts = []
+        for p in raw_posts:
+            p_copy = dict(p)
+            if not p_copy.get("text_zh") and p_copy.get("text"):
+                cached_zh = get_cached(p_copy["text"])
+                if cached_zh:
+                    p_copy["text_zh"] = cached_zh
+            posts.append(p_copy)
         return {
             "provider": provider,
             "kind": "watch",
@@ -954,7 +971,24 @@ async def _capture(page: Any, provider: str) -> dict[str, Any]:
         await page.wait_for_timeout(int(PAGE_SETTLE_SECONDS * 1000))
         text = await page.locator("body").inner_text(timeout=15_000)
         if provider_kind(provider) == "x" or provider == X_PROVIDER:
-            fields, confidence, status = await _parse_posts(page, text)
+            known_translations: dict[str, str] = {}
+            try:
+                conn_prev = _db()
+                prev_row = conn_prev.execute(
+                    "SELECT fields_json FROM captures WHERE provider=? AND status='healthy' ORDER BY id DESC LIMIT 1",
+                    (provider,),
+                ).fetchone()
+                conn_prev.close()
+                if prev_row and prev_row["fields_json"]:
+                    prev_fields = json.loads(prev_row["fields_json"] or "{}")
+                    for p in prev_fields.get("posts", []):
+                        p_txt = (p.get("text") or "").strip()
+                        p_zh = (p.get("text_zh") or "").strip()
+                        if p_txt and p_zh:
+                            known_translations[p_txt] = p_zh
+            except Exception as e:
+                LOG.debug("failed to load known translations for %s: %s", provider, e)
+            fields, confidence, status = await _parse_posts(page, text, known_translations=known_translations)
         else:
             fields, confidence, status = _parse(provider, text)
 

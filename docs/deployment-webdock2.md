@@ -270,9 +270,20 @@ services:
   3. 强化 `/healthz`：主动校验后台 `_task` 存活状态及心跳周期（超过 `POLL_MAX + 10m` 未推进判定 stalled），异常时返回 503 触发 Docker 自动拉起自愈。
   4. 为 `connect_over_cdp` 显式设置 30s 超时，杜绝 180s 长时间 hang 阻断循环。
 
+### 案例 10：2026-10 X 观察位翻译负缓存毒化与并发限流治理
+- **事故现象**：X 观察位在 Tibo 发布多条新推文后，网页控制台与飞书卡片再度丢失中文翻译（`text_zh` 全为 `null`），而更早的历史推文有翻译。
+- **根因分析**：
+  1. *负缓存毒化*：旧版 `quota_monitor/translate.py` 使用 `@functools.lru_cache` 装饰 `_translate_sync`，在网络偶发抖动或超时返回 `None` 时，`None` 也被存入缓存。后续每轮轮询采集由于推文未变，持续命中 `None` 缓存，导致翻译永久停摆。
+  2. *瞬时并发风暴*：采集器通过 `asyncio.gather` 同时并发 5~10 条推文的翻译请求，容易冲垮 Google 免费无鉴权接口并触发 8 秒超时，导致整批新推文全部失败落入 `None` 缓存。
+- **解法**：
+  1. 移除 `lru_cache`，改用显式正向 LRU 缓存（`collections.OrderedDict`）：**仅当翻译结果有效且非空时写入缓存**，网络超时/异常返回 `None` 时绝不缓存，保留下轮轮询自动重试自愈能力。
+  2. 异步翻译入口引入受限并发信号量（`asyncio.Semaphore(2)`）及双重缓存检查，避免瞬时并发打满代理或被接口限流；单次超时放宽至 10s。
+  3. 观察位解析（`_parse_posts`）优先继承上一次 healthy capture 中已翻译的旧帖（`known_translations`），消除老推文重复网络调用。
+  4. 卡片展示模型（`build_quota_card`）自动尝试从内存缓存补全历史记录中缺失的 `text_zh`。
+
 ---
 
-## 6. 核心交付准则与部署闭环 (SSOT)
+## 8. 核心交付准则与部署闭环 (SSOT)
 
 - **GitHub 作为唯一权威源码 (SSOT)**：
   任何逻辑修复、解析器演进或配置调整，在本地通过测试套件充分验证（`pytest`、`compileall`、`git diff --check`）后，**必须提交并推送到 GitHub 源码仓库，严格以 GitHub 源码为准执行**。严禁在生产宿主机上进行任何形式的手工热补丁或文件篡改。
