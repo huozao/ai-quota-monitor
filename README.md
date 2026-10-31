@@ -28,7 +28,8 @@ deduplicated by post id so a restart never re-sends one.
 
 Posts captured from the watch timeline are automatically translated to Chinese using
 `quota_monitor/translate.py` (via `translate.googleapis.com` through `CHROME_PROXY_SERVER`,
-with an in-memory LRU cache of 256 items and an 8-second timeout).
+with an in-memory positive-only LRU cache of 256 items, 10-second timeout, max-concurrency 2 protection,
+and cross-cycle translation inheritance to avoid redundant requests).
 In both Feishu notification cards and the web console (`https://hydwang.xyz/console/quota/`),
 posts display the original English text as the primary content, followed by the Chinese translation
 in subtle light grey small text (`<font color='grey'>` in Feishu markdown, `color: var(--muted); font-size: .82rem` in HTML).

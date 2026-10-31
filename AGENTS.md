@@ -40,6 +40,9 @@ to standalone clones; a private parent workspace is not required for local work.
   sit on a branch get reverted by the next apply from main. When the web page and Feishu
   disagree, compare the live page with infra main before suspecting this API.
   See Case 8 in [docs/deployment-webdock2.md](docs/deployment-webdock2.md).
+- **X watch translation resilience**:
+  X post translations (`quota_monitor/translate.py`) use an in-memory positive-only LRU cache (`OrderedDict`) protected by an event-loop-safe concurrency semaphore (max 2) and double-checked caching. Never cache negative/None results upon network error or timeouts, ensuring subsequent polling cycles can self-heal. Old translations are inherited across healthy capture cycles in `quota_monitor/app.py` to prevent redundant network requests.
+  See Case 10 in [docs/deployment-webdock2.md](docs/deployment-webdock2.md).
 
 ## Local verification
 
